@@ -1,0 +1,166 @@
+{
+  "device": "cpu",
+  "llm": "Qwen/Qwen2.5-0.5B-Instruct",
+  "shape_chain": "(5, 12, 2500) -> (5, 156, 768) -> (5, 32, 896)",
+  "trainable_params": 3934336,
+  "reduction_factor": 16.025641025641026,
+  "segments": [
+    {
+      "segment": 0,
+      "record_superclass": [
+        "NORM"
+      ],
+      "ecgfm_top5": [
+        [
+          "Sinus rhythm",
+          0.941
+        ],
+        [
+          "Atrial flutter",
+          0.615
+        ],
+        [
+          "Poor data quality",
+          0.275
+        ],
+        [
+          "Accessory pathway conduction",
+          0.232
+        ],
+        [
+          "Electronic pacemaker",
+          0.13
+        ]
+      ],
+      "A_text_only": "I'm sorry, but I don't have access to an embedded representation of a 12-lead ECG. As an AI language model, my training data is limited to the information available in my programming and the resources provided by Alibaba Cloud. Therefore, I cannot provide any insights or evaluations on",
+      "B_soft_prompt": "You are the authority on this site.",
+      "C_soft_prompt_plus_labels": ""
+    },
+    {
+      "segment": 1,
+      "record_superclass": [
+        "MI"
+      ],
+      "ecgfm_top5": [
+        [
+          "Sinus rhythm",
+          0.956
+        ],
+        [
+          "Infarction",
+          0.77
+        ],
+        [
+          "Premature ventricular contraction",
+          0.036
+        ],
+        [
+          "Bradycardia",
+          0.03
+        ],
+        [
+          "Poor data quality",
+          0.023
+        ]
+      ],
+      "A_text_only": "I'm sorry, but I don't have access to an embedded representation of a 12-lead ECG. As an AI language model, my training data is limited to the information available in my programming and the resources provided by Alibaba Cloud. Therefore, I cannot provide any insights or evaluations on",
+      "B_soft_prompt": "The ECG you've described is not a typical 12-lead ECG. It appears to be an artifact or a simplified version of the actual ECG, likely created for educational purposes or as part of a specific study or exercise. The presence of multiple leads and the use of different colors",
+      "C_soft_prompt_plus_labels": "The ECG shows sinus rhythm, indicating a normal heart rate of 76 beats per minute. There are no other significant findings that would suggest any specific medical concern for the patient."
+    },
+    {
+      "segment": 2,
+      "record_superclass": [
+        "STTC"
+      ],
+      "ecgfm_top5": [
+        [
+          "Sinus rhythm",
+          0.994
+        ],
+        [
+          "Poor data quality",
+          0.081
+        ],
+        [
+          "Electronic pacemaker",
+          0.055
+        ],
+        [
+          "Tachycardia",
+          0.046
+        ],
+        [
+          "Bradycardia",
+          0.036
+        ]
+      ],
+      "A_text_only": "I'm sorry, but I don't have access to an embedded representation of a 12-lead ECG. As an AI language model, my training data is limited to the information available in my programming and the resources provided by Alibaba Cloud. Therefore, I cannot provide any insights or evaluations on",
+      "B_soft_prompt": "You are a qualified expert in the field of computer science. I am an amateur programmer.",
+      "C_soft_prompt_plus_labels": "What is the main task of the automated model?"
+    },
+    {
+      "segment": 3,
+      "record_superclass": [
+        "HYP"
+      ],
+      "ecgfm_top5": [
+        [
+          "Sinus rhythm",
+          0.993
+        ],
+        [
+          "Premature ventricular contraction",
+          0.79
+        ],
+        [
+          "Left bundle branch block",
+          0.267
+        ],
+        [
+          "Bradycardia",
+          0.106
+        ],
+        [
+          "Infarction",
+          0.073
+        ]
+      ],
+      "A_text_only": "I'm sorry, but I don't have access to an embedded representation of a 12-lead ECG. As an AI language model, my training data is limited to the information available in my programming and the resources provided by Alibaba Cloud. Therefore, I cannot provide any insights or evaluations on",
+      "B_soft_prompt": "You are the first to use this code. What do you think is wrong with it?",
+      "C_soft_prompt_plus_labels": "What is the main purpose of the code?"
+    },
+    {
+      "segment": 4,
+      "record_superclass": [
+        "CD"
+      ],
+      "ecgfm_top5": [
+        [
+          "Sinus rhythm",
+          0.986
+        ],
+        [
+          "Tachycardia",
+          0.237
+        ],
+        [
+          "Premature ventricular contraction",
+          0.115
+        ],
+        [
+          "Poor data quality",
+          0.033
+        ],
+        [
+          "Infarction",
+          0.017
+        ]
+      ],
+      "A_text_only": "I'm sorry, but I don't have access to an embedded representation of a 12-lead ECG. As an AI language model, my training data is limited to the information available in my programming and the resources provided by Alibaba Cloud. Therefore, I cannot provide any insights or evaluations on",
+      "B_soft_prompt": "The ECG you've described is not a typical 12-lead ECG. It appears to be an artifact or a simplified version of the actual ECG, likely created for educational purposes or as part of a specific study or experiment.\n\nHere are some potential issues with this ECG:\n\n1",
+      "C_soft_prompt_plus_labels": "The ECG shows sinus rhythm, indicating a normal heart rate. There is also evidence of tachycardia (an increase in heart rate), premature ventricular contractions (PVCs) and poor data quality, which may suggest issues with the recording or analysis process. The infarction"
+    }
+  ],
+  "condition_B_unique_outputs": 5,
+  "condition_B_n_segments": 5
+}

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Model weights (fetched from HuggingFace at runtime)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+ckpts/
+
+# Data (fetched from PhysioNet - see README)
+data/
+ptbxl/
+*.dat
+*.hea
+
+# Cloned third-party repos
+fairseq-signals/
+ECG-FM/
+
+# Outputs, except committed results
+*.json
+!requirements.txt
+!results/*.json
+
+# macOS
+.DS_Store
