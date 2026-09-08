@@ -51,7 +51,7 @@ not a bug: training it is the next task.
 | **B** | soft prompt, no labels | fluent but confabulated |
 | **C** | soft prompt + labels as text | unstable; sometimes empty, sometimes echoes the labels |
 
-All eight segments in `results/baseline.json` are ground-truth **NORM**. Not one
+All eight segments in `results/baseline.json` are ground-truth **NORM**. Five segments in `results/baseline_stratified.json` are ground-truth **NORM**, **MI**, **STTC**, **HYP** and **CD**. Not one
 condition-B output identifies normal sinus rhythm. Instead:
 
 ```
@@ -167,8 +167,8 @@ wget -nH --cut-dirs=3 \
 ```bash
 mkdir -p results
 python scripts/run_baseline.py \
-  --ptb ./data/ptbxl --ckpts ./data/ckpts --ecgfm-repo ./ECG-FM \
-  --device cpu --n-records 4 --out results/baseline.json
+--ptb ./data/ptbxl --ckpts ./data/ckpts --ecgfm-repo ./ECG-FM \
+--device cpu --stratify --first-segment-only --out results/baseline_stratified.json
 
 # one record per diagnostic superclass (NORM, MI, STTC, CD, HYP)
 python scripts/run_baseline.py \
