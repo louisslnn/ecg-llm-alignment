@@ -1,0 +1,22 @@
+# Core
+torch>=2.0
+numpy
+pandas
+scipy
+
+# ECG data
+wfdb>=4.1
+ecg-transform==0.1.3
+
+# Models
+transformers>=4.40
+accelerate
+huggingface_hub
+
+# fairseq-signals must be installed from source:
+#   git clone https://github.com/Jwoo5/fairseq-signals
+#   cd fairseq-signals && pip install -e .
+
+# Optional: analysis
+matplotlib
+umap-learn
