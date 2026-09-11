@@ -27,5 +27,9 @@ ECG-FM/
 !requirements.txt
 !results/*.json
 
+# Markdown files
+ROADMAP.md
+LOGS.md
+
 # macOS
 .DS_Store
