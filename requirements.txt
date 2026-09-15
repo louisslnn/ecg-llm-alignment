@@ -14,6 +14,9 @@ transformers>=4.40
 accelerate
 huggingface_hub
 
+# Teacher generation client (async OpenAI-compatible calls)
+httpx>=0.27
+
 # fairseq-signals must be installed from source:
 #   git clone https://github.com/Jwoo5/fairseq-signals
 #   cd fairseq-signals && pip install -e .

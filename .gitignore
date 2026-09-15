@@ -18,6 +18,10 @@ ptbxl/
 *.dat
 *.hea
 
+# Secrets (teacher endpoint credentials); .env.example is committed
+.env
+.env.local
+
 # Cloned third-party repos
 fairseq-signals/
 ECG-FM/
