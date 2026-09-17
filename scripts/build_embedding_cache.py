@@ -34,8 +34,8 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
 
 from src import cache as C
-from src import data as D
 from src import encoder as E
+from src import ptbxl_data as D
 from src import manifest as M
 
 log = logging.getLogger("build_embedding_cache")

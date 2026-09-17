@@ -28,9 +28,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from src import data as D
 from src import encoder as E
 from src import generate as G
+from src import ptbxl_data as D
 from src.modules import Aligner
 
 

@@ -82,9 +82,9 @@ def load_full_record_source(ecg_id: int, ptb_root: str) -> torch.Tensor:
     padded or cropped to fit.
     """
     try:
-        from . import data as D
+        from . import ptbxl_data as D
     except ImportError:  # allow flat `sys.path.insert(0, "src")` imports too
-        import data as D
+        import ptbxl_data as D
 
     path = D.resolve_record_path(ptb_root, ecg_id)
     schema, transforms = D.build_schema_and_transforms(segment=False)

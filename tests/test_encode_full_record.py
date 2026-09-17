@@ -17,8 +17,8 @@ import torch
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from src import data as D
 from src import encoder as E
+from src import ptbxl_data as D
 
 PTB_ROOT = os.environ.get("PTB_ROOT", os.path.join(REPO_ROOT, "data/ptbxl"))
 CKPT_DIR = os.environ.get("CKPT_DIR", os.path.join(REPO_ROOT, "data/ckpts"))
