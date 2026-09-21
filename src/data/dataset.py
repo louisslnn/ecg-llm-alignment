@@ -14,8 +14,9 @@ What one example carries:
                     annotations. This is the whole point: the student must recover
                     the answer from the signal, not read it off the labels.
   * ``target``      the teacher's Evidence/Reasoning/Conclusion text for that
-                    superclass, taken verbatim from ``parsed_clean`` (never
-                    re-parsed). Loss is computed on this.
+                    superclass, taken verbatim from ``parsed_final`` (the parse of
+                    the report-reference-rewritten ``final_content``; never
+                    re-parsed here). Loss is computed on this.
   * ``label``       the known Yes/No boolean for (record, superclass), for the
                     linear head that attaches alongside the LM loss.
   * ``ecg_id`` / ``superclass`` / ``strat_fold`` for bookkeeping and splitting.
@@ -149,7 +150,7 @@ class EmbeddingCache:
 class DatasetConfig:
     emb_cache_dir: str = os.path.join(REPO_ROOT, "data", "emb_cache")
     manifest_path: str = os.path.join(REPO_ROOT, "data", "ptbxl", "manifest.jsonl")
-    teacher_path: str = os.path.join(REPO_ROOT, "data", "teacher", "full_v6.jsonl")
+    teacher_path: str = os.path.join(REPO_ROOT, "data", "teacher", "full_v6_final.jsonl")
 
     # The student LLM. `debug` swaps in the 0.5B model so tokenisation (and the
     # rest of the training loop) runs on CPU locally.
@@ -235,6 +236,9 @@ def _extract_teacher_blocks(path: str):
     Returns ``(usable, status, teacher_ids)`` where ``usable[ecg_id][sc]`` is the
     verbatim ``raw_block`` for usable blocks, and ``status[ecg_id][sc]`` is the
     exclusion reason for the rest.
+
+    Reads ``parsed_final`` -- the parse of ``final_content``, after the
+    report-reference rewrite -- which is the canonical target for training.
     """
     usable: Dict[int, Dict[str, str]] = {}
     status: Dict[int, Dict[str, str]] = {}
@@ -247,7 +251,7 @@ def _extract_teacher_blocks(path: str):
             d = json.loads(line)
             eid = int(d["ecg_id"])
             teacher_ids.add(eid)
-            pc = d.get("parsed_clean") or {}
+            pc = d.get("parsed_final") or {}
             blocks = pc.get("blocks") or {}
             unparseable = pc.get("unparseable_conclusion") or []
             if isinstance(unparseable, dict):

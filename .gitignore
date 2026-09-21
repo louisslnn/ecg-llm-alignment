@@ -13,7 +13,7 @@ venv/
 ckpts/
 
 # Data (fetched from PhysioNet - see README)
-data/
+/data/
 ptbxl/
 *.dat
 *.hea

@@ -32,12 +32,13 @@ from src.teacher.view import build_view
 
 CONFIG = DatasetConfig(debug=True)
 
-# Expected exclusion accounting, measured directly from the artifacts.
-EXPECTED_KEPT = 108_855
+# Expected exclusion accounting over parsed_final (full_v6_final.jsonl, after the
+# regen merge + report-reference rewrite). The regen fixed almost all the gaps.
+EXPECTED_KEPT = 108_962
 EXPECTED_PREEXCLUDED = 6
-EXPECTED_BLOCK_MISSING = 53
-EXPECTED_PARSE_FAILED = 45
-EXPECTED_EMPTY_REASONING = 12
+EXPECTED_BLOCK_MISSING = 2
+EXPECTED_PARSE_FAILED = 1
+EXPECTED_EMPTY_REASONING = 0
 
 _SPLITS = None
 
@@ -50,7 +51,7 @@ def splits():
 
 
 def _read_raw_blocks(teacher_path, wanted_ids):
-    """Independently read parsed_clean.raw_block for a set of ecg_ids."""
+    """Independently read parsed_final.raw_block for a set of ecg_ids."""
     wanted = set(wanted_ids)
     out = {}
     with open(teacher_path, encoding="utf-8") as f:
@@ -61,7 +62,7 @@ def _read_raw_blocks(teacher_path, wanted_ids):
             eid = int(d["ecg_id"])
             if eid not in wanted:
                 continue
-            blocks = (d.get("parsed_clean") or {}).get("blocks") or {}
+            blocks = (d.get("parsed_final") or {}).get("blocks") or {}
             out[eid] = {
                 sc: (b.get("raw_block") or "").strip() for sc, b in blocks.items()
             }
@@ -152,16 +153,16 @@ def test_prompt_has_no_report_or_scp_content():
     assert checked_with_report >= 5  # the check actually exercised real reports
 
 
-def test_target_from_parsed_clean_and_no_supervision_phrases():
+def test_target_from_parsed_final_and_no_supervision_phrases():
     ds = splits()["train"]
     rng = random.Random(2)
     picks = [ds[i] for i in rng.sample(range(len(ds)), 6)]
     raw = _read_raw_blocks(CONFIG.teacher_path, {it["ecg_id"] for it in picks})
 
     for it in picks:
-        # Target is the verbatim parsed_clean block, not a reconstruction.
+        # Target is the verbatim parsed_final block, not a reconstruction.
         assert it["target"] == raw[it["ecg_id"]][it["superclass"]], it["ecg_id"]
-        # parsed_clean is already stripped: no supervision-pipeline tell survives.
+        # parsed_final is already stripped: no supervision-pipeline tell survives.
         assert not is_leak_step(it["target"]), (it["ecg_id"], it["superclass"])
         assert it["target"].startswith("Evidence")
 

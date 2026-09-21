@@ -49,6 +49,9 @@ def main():
     blocks_rewritten = 0
     residual_before = 0
     residual_after = 0
+    blocks_matching_before = 0       # blocks matching any pattern before rewrite
+    blocks_matching_after = 0        # blocks STILL matching any pattern afterwards
+    residual_blocks_per_pattern = Counter()   # after-rewrite, by residual pattern
     net_new_parse_failures = 0       # parsed clean before, broke after rewrite
     pairs_by_rule = {}               # single-rule name -> list of (before, after)
     residual_samples = []
@@ -80,13 +83,20 @@ def main():
                     for rule, n in counts.items():
                         blocks_per_rule[rule] += 1
                         subs_per_rule[rule] += n
-                residual_before += PP.count_report_reference_residual(text)
+                before_res = PP.count_report_reference_residual(text)
                 after_res = PP.count_report_reference_residual(new_text)
+                residual_before += before_res
                 residual_after += after_res
+                blocks_matching_before += 1 if before_res else 0
+                blocks_matching_after += 1 if after_res else 0
+                for pat in PP.report_reference_pattern_hits(new_text):
+                    residual_blocks_per_pattern[pat] += 1
                 if after_res and len(residual_samples) < 15:
-                    m = PP._REPORT_RESIDUAL_RE.search(new_text)
-                    if m:
-                        residual_samples.append(new_text[max(0, m.start() - 25):m.end() + 25])
+                    for rx in PP._RESIDUAL_PATTERNS.values():
+                        m = rx.search(new_text)
+                        if m:
+                            residual_samples.append(new_text[max(0, m.start() - 25):m.end() + 25])
+                            break
 
             # 3. collect before/after pairs bucketed by rule for an even spread.
             for counts, before, after in _changed_sentence_pairs(cleaned):
@@ -101,8 +111,13 @@ def main():
     print(f"scanned blocks: {blocks_seen}   rewritten: {blocks_rewritten} "
           f"({100 * blocks_rewritten / max(blocks_seen, 1):.1f}%)")
     print(f"net-new re-parse failures from the rewrite: {net_new_parse_failures}")
-    print(f"report-referencing residual  before: {residual_before}  after: {residual_after} "
-          f"(remaining = positive/unhandled references, reported not rewritten)")
+    print(f"report-referencing residual (matches)  before: {residual_before}  after: {residual_after}")
+    print(f"blocks still matching any pattern       before: {blocks_matching_before}  "
+          f"after: {blocks_matching_after}  "
+          f"({100 * blocks_matching_after / max(blocks_seen, 1):.2f}% of blocks)")
+    print("\nblocks STILL matching after rewrite, broken down by pattern:")
+    for pat in PP._RESIDUAL_PATTERNS:
+        print(f"  {pat:18} {residual_blocks_per_pattern[pat]:>6}")
 
     print("\nblocks rewritten per rule (and total substitutions):")
     order = [name for name, _, _ in PP.REWRITE_RULES]
