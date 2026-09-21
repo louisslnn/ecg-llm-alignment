@@ -140,13 +140,14 @@ def check_gradients(model, resampler):
     return norms
 
 
-def one_step(model, resampler, batch, dev):
-    """One forward + backward, then verify the backward reached the resampler.
+def splice_forward(model, resampler, batch, dev):
+    """The validated splice: prepend resampler latents to the token embeddings and
+    run the frozen LLM, loss on the target only. Returns ``out.loss``.
 
-    Raises on OOM (caller handles) or GradFlowError (fatal). Returns loss + norms.
+    Prompt + padding are already -100 in ``batch["labels"]``; the 64 latent
+    positions are masked to -100 here too, so loss lands only on the target. Shared
+    by the memory probe and the training loop so they compute an identical step.
     """
-    resampler.zero_grad(set_to_none=True)
-
     ecg = batch["ecg_embed"].to(dev)
     input_ids = batch["input_ids"].to(dev)
     attn = batch["attention_mask"].to(dev)
@@ -158,9 +159,10 @@ def one_step(model, resampler, batch, dev):
         B, Lq, _ = latents.shape
 
         # The latents are the prefix; the spliced tensor must carry their grad
-        # through to the LLM, or the whole backward path is dead on arrival.
+        # through to the LLM, or the whole backward path is dead on arrival. (Only
+        # meaningful with grad enabled -- validation runs this under no_grad.)
         full_embeds = torch.cat([latents, tok_embeds], dim=1)
-        if not full_embeds.requires_grad:
+        if torch.is_grad_enabled() and not full_embeds.requires_grad:
             raise GradFlowError("spliced inputs_embeds.requires_grad is False: "
                                 "the resampler prefix is detached from the graph")
         full_attn = torch.cat(
@@ -177,8 +179,16 @@ def one_step(model, resampler, batch, dev):
             labels=full_labels,
             use_cache=False,
         )
-        loss = out.loss
+    return out.loss
 
+
+def one_step(model, resampler, batch, dev):
+    """One forward + backward, then verify the backward reached the resampler.
+
+    Raises on OOM (caller handles) or GradFlowError (fatal). Returns loss + norms.
+    """
+    resampler.zero_grad(set_to_none=True)
+    loss = splice_forward(model, resampler, batch, dev)
     loss.backward()
     norms = check_gradients(model, resampler)
     return {"loss": float(loss.detach()), "norms": norms}
