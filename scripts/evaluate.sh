@@ -15,9 +15,15 @@
 #   MODEL_DIR=... VENV=... sbatch scripts/evaluate.sh --limit 500
 #   CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt sbatch scripts/evaluate.sh
 #
-# THE CONTROL -- run this second, always, and read it next to the main run:
-#   sbatch scripts/evaluate.sh --shuffle-embeddings
-# (it writes eval_<split>_shuffled.jsonl, so it cannot clobber the main run).
+# THE CONTROLS -- run these too, and read them next to the main run:
+#   sbatch scripts/evaluate.sh --shuffle-embeddings     # wrong ECG per record
+#   sbatch scripts/evaluate.sh --zero-latents           # prefix carries nothing
+# Each writes its own eval_<split>_<condition>.jsonl, so none can clobber another.
+# For all three conditions plus the teacher-forced loss in ONE job (one model load,
+# with a comparison table at the end), use scripts/eval_controls.sh instead.
+#
+# Teacher-forced loss instead of generation, on the real targets:
+#   sbatch scripts/evaluate.sh --teacher-forced-loss --limit 2000
 #
 # ONE HOUR IS NOT THE FULL TEST SPLIT. Test is 10,977 examples, each ~200-400
 # greedy tokens from a 14B sharded over two cards; a single hour covers a few
@@ -47,11 +53,14 @@ EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval}"
 SPLIT="${SPLIT:-test}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 
-# The control writes its own file; overwriting the main run's generations with the
-# shuffled ones would destroy the only thing worth comparing it against.
+# Every condition writes its own file; overwriting the main run's generations with a
+# control's would destroy the only thing worth comparing it against. Mirrors
+# evaluate.py's own default naming (condition_suffix).
 SUFFIX=""
 for arg in "$@"; do
-    [[ "$arg" == "--shuffle-embeddings" ]] && SUFFIX="_shuffled"
+    [[ "$arg" == "--shuffle-embeddings" ]] && SUFFIX="${SUFFIX}_shuffled"
+    [[ "$arg" == "--zero-latents" ]] && SUFFIX="${SUFFIX}_zeroed"
+    [[ "$arg" == "--teacher-forced-loss" ]] && SUFFIX="${SUFFIX}_teacher_forced"
 done
 OUT="${OUT:-$EVAL_DIR/eval_${SPLIT}${SUFFIX}.jsonl}"
 

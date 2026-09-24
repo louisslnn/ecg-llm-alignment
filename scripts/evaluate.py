@@ -27,14 +27,29 @@ superclasses as separate subsets: F1, precision, recall, AUPRC, AUROC and the
 0.10 positive rate and worthless at 0.30. The ``lift`` column is AUPRC / positive
 rate for exactly that reading.
 
-``--shuffle-embeddings`` is the control that decides whether any of this is about
-the waveform. It permutes the cached ECG embeddings across records within the split
-(one donor per record, so all five of a record's questions get the same wrong ECG)
-and leaves prompts and labels untouched: every question is now asked about someone
-else's heart. Metrics that survive that permutation were never coming from the
-signal -- they are the label prior plus whatever age/sex leaks. The permutation is a
-single cycle over a seeded shuffle, so it has no fixed points, and the seed is
-logged and written into every output record.
+Two controls decide whether any of this is about the waveform, and both leave the
+prompts and labels exactly as they are:
+
+* ``--shuffle-embeddings`` permutes the cached ECG embeddings across records within
+  the split (one donor per record, so all five of a record's questions get the same
+  wrong ECG): every question is now asked about someone else's heart. The
+  permutation is a single cycle over a seeded shuffle, so it has no fixed points,
+  and the seed is logged and written into every output record.
+* ``--zero-latents`` runs the resampler and then throws its output away, splicing a
+  zero tensor of the same shape in its place. The prefix is still 64 positions wide
+  and still attended to; it simply carries nothing. Where shuffling asks "does it
+  use *this* ECG?", zeroing asks "does it use the prefix at all?".
+
+Metrics that survive either control were never coming from the signal -- they are
+the label prior plus whatever age and sex leak through the question.
+
+``--teacher-forced-loss`` is the other half of the picture and generates nothing.
+It builds the same prompts, appends the real teacher target, and computes the
+next-token loss under training's masking (prompt, padding and latents at -100, loss
+on the target only), reporting the mean over the evaluated examples. It answers a
+question free generation cannot: whether the model assigns probability to the right
+continuation, even when its own greedy decode wanders off. It is directly comparable
+to the train/val loss the training loop prints, and it accepts both controls.
 
 Every generation, its parsed conclusion, its probability and its label go to jsonl,
 so ``--from-jsonl`` recomputes the whole metrics table without touching a GPU.
@@ -45,13 +60,22 @@ so ``--from-jsonl`` recomputes the whole metrics table without touching a GPU.
     # 500 examples, quick look
     python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt --limit 500
 
-    # the control (writes results/eval_test_shuffled.jsonl by default, so it
-    # cannot overwrite the run it is meant to be compared against)
+    # the controls (each writes its own default filename, so neither can overwrite
+    # the run it is meant to be compared against)
     python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt \
         --shuffle-embeddings
+    python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt \
+        --zero-latents
+
+    # teacher-forced loss on 200 examples, no generation
+    python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt \
+        --teacher-forced-loss --limit 200
 
     # metrics only, no model load
     python scripts/evaluate.py --from-jsonl $EVAL_DIR/test.jsonl
+
+    # all of the above in one job, one model load (see scripts/eval_controls.py)
+    python scripts/eval_controls.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt
 
 Generation is the cost here: ~200-400 new tokens per example on a 14B sharded over
 two A100s. Budget accordingly, use --limit for anything interactive, and --resume to
@@ -67,10 +91,12 @@ import os
 import sys
 import time
 from bisect import bisect_right
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
@@ -81,6 +107,7 @@ from src.data.dataset import (  # noqa: E402
     DatasetConfig,
     _format_prompt,
     build_datasets,
+    make_collate_fn,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 from src.teacher import parse as teacher_parse  # noqa: E402
@@ -123,10 +150,20 @@ def parse_args():
     ap.add_argument("--from-jsonl", default=None,
                     help="recompute metrics from an existing jsonl and exit; no GPU, "
                          "no model load")
-    # the control
+    # teacher-forced loss instead of generation
+    ap.add_argument("--teacher-forced-loss", action="store_true",
+                    help="skip generation: append the real target to the prompt and "
+                         "report the mean next-token loss under training's masking")
+    ap.add_argument("--max-length", type=int, default=2048,
+                    help="token cap for prompt+target in --teacher-forced-loss "
+                         "(training's MAX_TEXT_LEN)")
+    # the controls
     ap.add_argument("--shuffle-embeddings", action="store_true",
                     help="permute ECG embeddings across records within the split "
-                         "(prompts and labels untouched): the does-it-use-the-waveform control")
+                         "(prompts and labels untouched): the does-it-use-THIS-ECG control")
+    ap.add_argument("--zero-latents", action="store_true",
+                    help="run the resampler, then splice a zero tensor of the same "
+                         "shape in place of its output: the does-it-use-the-prefix control")
     ap.add_argument("--seed", type=int, default=42,
                     help="seed for the embedding permutation; logged and recorded")
     ap.add_argument("--num-workers", type=int, default=4)
@@ -528,23 +565,23 @@ def build_generation_config(max_new_tokens: int, eos_id: int, pad_id: int):
     )
 
 
-@torch.no_grad()
-def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
-                   gen_config):
-    """One batch: splice latents in front of the prompt, then greedy-decode to <END>.
+def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False):
+    """Token embeddings with the resampler's latents spliced in front.
 
     The splice is the training splice (scripts/probe_memory.py splice_forward):
-    latents first, then the token embeddings. Left padding means the pads sit between
-    the latents and the real prompt; position ids are derived from the attention mask,
-    so the real tokens still see the latents at the positions training put them.
-    """
-    ecg = batch["ecg_embed"].to(dev)
-    input_ids = batch["input_ids"].to(dev)
-    attn = batch["attention_mask"].to(dev)
+    latents first, then the token embeddings, with the prefix always attendable.
+    Shared by generation and the teacher-forced loss so the two cannot drift.
 
+    ``zero_latents`` runs the resampler and then discards its output, splicing zeros
+    of the same shape. Zeroing AFTER the forward pass rather than skipping it keeps
+    the prefix the same width and the tensor path identical, so the only thing that
+    changes is whether the prefix carries information.
+    """
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
         latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=attn.bool())
+    if zero_latents:
+        latents = torch.zeros_like(latents)
     # torch.cat needs one dtype; autocast can hand back fp32 from a LayerNorm-final
     # path, and the student runs in bf16 regardless.
     latents = latents.to(tok_embeds.dtype)
@@ -553,6 +590,22 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
     full_embeds = torch.cat([latents, tok_embeds], dim=1)
     full_attn = torch.cat(
         [torch.ones(B, Lq, dtype=attn.dtype, device=dev), attn], dim=1
+    )
+    return full_embeds, full_attn, Lq
+
+
+@torch.no_grad()
+def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
+                   gen_config, zero_latents=False):
+    """One batch: splice latents in front of the prompt, then greedy-decode to <END>.
+
+    Left padding means the pads sit between the latents and the real prompt; position
+    ids are derived from the attention mask, so the real tokens still see the latents
+    at the positions training put them.
+    """
+    full_embeds, full_attn, _ = splice_prefix(
+        model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
+        batch["attention_mask"].to(dev), dev, zero_latents=zero_latents,
     )
 
     capture.reset()
@@ -565,6 +618,51 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
     )
     # Generating from inputs_embeds returns ONLY the new tokens (no prompt echo).
     return out
+
+
+@torch.no_grad()
+def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False):
+    """Per-example next-token loss on the real target. Returns [(loss, n_tokens)].
+
+    The batch comes from training's own collate (``src.data.dataset.make_collate_fn``),
+    so the prompt is built exactly as generation builds it, the real target and EOS
+    follow it, and prompt plus padding are already -100 in ``labels``. The latent
+    positions are masked to -100 here as well, leaving the loss on the target alone --
+    the identical arrangement scripts/probe_memory.py trains on.
+
+    The loss is reduced per example rather than per batch: a batch mean would weight
+    long targets more heavily, and the number reported is a mean over examples.
+    """
+    labels = batch["labels"].to(dev)
+    attn = batch["attention_mask"].to(dev)
+    full_embeds, full_attn, Lq = splice_prefix(
+        model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
+        attn, dev, zero_latents=zero_latents,
+    )
+    B = labels.shape[0]
+    full_labels = torch.cat(
+        [torch.full((B, Lq), -100, dtype=labels.dtype, device=dev), labels], dim=1
+    )
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        out = model(inputs_embeds=full_embeds, attention_mask=full_attn, use_cache=False)
+
+    # position t's logits predict token t+1
+    logits = out.logits[:, :-1]
+    targets = full_labels[:, 1:]
+    per_example = []
+    for i in range(B):
+        keep = targets[i] != -100
+        n = int(keep.sum())
+        if n == 0:                       # a target truncated away entirely by --max-length
+            per_example.append((None, 0))
+            continue
+        # Upcast only the target positions: the full (B, L, 152k) tensor in fp32
+        # would be gigabytes for a number that depends on a few hundred rows.
+        loss = F.cross_entropy(logits[i][keep].float(), targets[i][keep],
+                               reduction="mean")
+        per_example.append((float(loss), n))
+    return per_example
 
 
 def trim_generated(ids: Sequence[int], eos_id: int, pad_id: int) -> List[int]:
@@ -583,9 +681,23 @@ def trim_generated(ids: Sequence[int], eos_id: int, pad_id: int) -> List[int]:
 # --------------------------------------------------------------------------- #
 
 
+def condition_suffix(shuffle_embeddings: bool, zero_latents: bool,
+                     teacher_forced: bool = False) -> str:
+    """Filename tag for one condition, so no two conditions share an output file."""
+    parts = []
+    if shuffle_embeddings:
+        parts.append("_shuffled")
+    if zero_latents:
+        parts.append("_zeroed")
+    if teacher_forced:
+        parts.append("_teacher_forced")
+    return "".join(parts)
+
+
 def default_out_path(args) -> str:
-    name = f"eval_{args.split}{'_shuffled' if args.shuffle_embeddings else ''}.jsonl"
-    return os.path.join(REPO_ROOT, "results", name)
+    suffix = condition_suffix(args.shuffle_embeddings, args.zero_latents,
+                              args.teacher_forced_loss)
+    return os.path.join(REPO_ROOT, "results", f"eval_{args.split}{suffix}.jsonl")
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -631,6 +743,7 @@ def check_resume(args):
         return set(), "w"
     prior = read_jsonl(args.out)
     for field, want in (("shuffled_embeddings", bool(args.shuffle_embeddings)),
+                        ("zero_latents", bool(args.zero_latents)),
                         ("seed", args.seed), ("split", args.split)):
         have = {r.get(field) for r in prior}
         if have and have != {want}:
@@ -658,6 +771,287 @@ def summarise_run(records: List[dict], n_impure: int, elapsed: float) -> None:
           f"Yes/No token merged with following text: {n_impure}")
 
 
+
+
+def summarise_teacher_forced(records: List[dict]) -> Dict[str, Any]:
+    """Mean loss over examples, plus the token-weighted mean and a per-superclass cut."""
+    scored = [r for r in records if r["loss"] is not None]
+    losses = np.array([r["loss"] for r in scored], dtype=np.float64)
+    ntok = np.array([r["n_target_tokens"] for r in scored], dtype=np.float64)
+    summary: Dict[str, Any] = {
+        "n": len(records),
+        "n_scored": len(scored),
+        "mean_loss": float(losses.mean()) if len(scored) else None,
+        # the batch-mean a training loop reports weights long targets more heavily;
+        # both are given so the number can be lined up with either convention
+        "token_weighted_mean_loss": (float((losses * ntok).sum() / ntok.sum())
+                                     if len(scored) and ntok.sum() > 0 else None),
+        "median_loss": float(np.median(losses)) if len(scored) else None,
+        "mean_target_tokens": float(ntok.mean()) if len(scored) else None,
+        "per_superclass": {},
+    }
+    for sc in SUPERCLASSES:
+        vals = [r["loss"] for r in scored if r["superclass"] == sc]
+        summary["per_superclass"][sc] = {
+            "n": len(vals),
+            "mean_loss": float(np.mean(vals)) if vals else None,
+        }
+    return summary
+
+
+def print_teacher_forced(summary: Dict[str, Any]) -> None:
+    print("\n" + "=" * 56)
+    print("TEACHER-FORCED LOSS  (next-token loss on the real target)")
+    print("=" * 56)
+    print(f"  examples scored          {summary['n_scored']:,} of {summary['n']:,}")
+    print(f"  MEAN LOSS over examples  {_fmt(summary['mean_loss'], width=7, prec=4)}")
+    print(f"  token-weighted mean      {_fmt(summary['token_weighted_mean_loss'], width=7, prec=4)}")
+    print(f"  median                   {_fmt(summary['median_loss'], width=7, prec=4)}")
+    mtt = summary["mean_target_tokens"]
+    print(f"  mean target tokens       {mtt:.0f}" if mtt else "  mean target tokens       n/a")
+    print("  per superclass:")
+    for sc, m in summary["per_superclass"].items():
+        print(f"    {sc:<5} n {m['n']:>6}  loss {_fmt(m['mean_loss'], width=7, prec=4)}")
+
+
+# --------------------------------------------------------------------------- #
+# The passes. Each takes a loaded context, so a runner can do several of them  #
+# on one model load (see scripts/eval_controls.py).                           #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class EvalContext:
+    """Everything loaded once: the frozen student, the resampler, the readout ids."""
+
+    model: Any
+    resampler: Any
+    tokenizer: Any
+    dev: Any
+    eos_id: int
+    pad_id: int
+    yes_pos: List[int]
+    no_pos: List[int]
+    capture: Any
+    processors: Any
+
+    @classmethod
+    def load(cls, model_dir: str, ckpt: str, tokenizer=None) -> "EvalContext":
+        from transformers import AutoTokenizer, LogitsProcessorList
+
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+
+        print("loading frozen student (bf16, device_map=auto) ...")
+        model = load_student(model_dir)
+        model.config.use_cache = True  # load_student turns it off for the backward pass
+        dev = next(model.get_input_embeddings().parameters()).device
+        resampler = load_resampler(ckpt, dev)
+
+        yes_ids, no_ids = yes_no_token_ids(tokenizer)
+        cand_ids = yes_ids + no_ids
+        print(f"Yes token ids {yes_ids} -> {[tokenizer.decode([i]) for i in yes_ids]}")
+        print(f"No  token ids {no_ids} -> {[tokenizer.decode([i]) for i in no_ids]}")
+        capture = ConclusionLogitCapture(cand_ids, dev)
+        return cls(
+            model=model, resampler=resampler, tokenizer=tokenizer, dev=dev,
+            eos_id=eos_id, pad_id=pad_id,
+            yes_pos=list(range(len(yes_ids))),
+            no_pos=list(range(len(yes_ids), len(cand_ids))),
+            capture=capture, processors=LogitsProcessorList([capture]),
+        )
+
+
+def load_split(data_cfg: DatasetConfig, split: str):
+    """The split, built once. Wrapping it for a control is cheap; this is not."""
+    dataset = build_datasets(data_cfg)[split]
+    print(f"split {split}: {len(dataset):,} examples "
+          f"({len({e.ecg_id for e in dataset.examples}):,} records)")
+    return dataset
+
+
+def apply_shuffle(dataset, seed: int):
+    """Wrap a split in the embedding permutation, announcing what it did."""
+    shuffled = ShuffledEmbeddings(dataset, seed)
+    print("*** SHUFFLE-EMBEDDINGS CONTROL ACTIVE ***")
+    print(f"    ECG embeddings permuted across {len(shuffled.mapping):,} records "
+          f"within the split, SEED {seed}, "
+          f"{shuffled.n_fixed_points} record(s) kept their own embedding")
+    print("    prompts and labels are untouched: every question is asked about "
+          "another record's ECG")
+    return shuffled
+
+
+def base_of(dataset):
+    return dataset.base if isinstance(dataset, ShuffledEmbeddings) else dataset
+
+
+def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: str, *,
+                   split: str, seed: int, shuffled: bool, zero_latents: bool,
+                   max_new_tokens: int, batch_size: int, num_workers: int = 4,
+                   max_prompt_length: int = 1024, print_first: int = 0,
+                   log_every: int = 20, mode: str = "w"):
+    """Generate over ``indices``, writing one jsonl line per example as it lands.
+
+    Returns ``(records, n_impure, elapsed)``. Written so a caller can run it several
+    times on one loaded context, once per condition.
+    """
+    from torch.utils.data import DataLoader, Subset
+
+    loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=make_eval_collate(ctx.tokenizer, max_prompt_length),
+    )
+    gen_config = build_generation_config(max_new_tokens, ctx.eos_id, ctx.pad_id)
+    print(f"greedy decoding, max_new_tokens={max_new_tokens}, stop at {END_MARKER}, "
+          f"batch {batch_size}; decoding config set explicitly "
+          f"(repetition_penalty {gen_config.repetition_penalty}, "
+          f"do_sample {gen_config.do_sample})"
+          + ("  [ZERO-LATENTS CONTROL: the prefix carries nothing]" if zero_latents else ""))
+
+    records: List[dict] = []
+    n_impure = 0
+    n_printed = 0
+    t0 = time.time()
+    with open(out_path, mode, encoding="utf-8") as fout:
+        for bi, batch in enumerate(loader):
+            sequences = generate_batch(ctx.model, ctx.resampler, ctx.tokenizer, batch,
+                                       ctx.dev, ctx.processors, ctx.capture, gen_config,
+                                       zero_latents=zero_latents)
+            steps = ctx.capture.steps   # steps[t][b] = logits over cand_ids at step t
+            for b in range(sequences.shape[0]):
+                gen_ids = trim_generated(sequences[b].tolist(), ctx.eos_id, ctx.pad_id)
+                text = ctx.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                step, token_text, status = locate_conclusion(ctx.tokenizer, gen_ids)
+
+                p_yes = None
+                if step is not None and step < len(steps):
+                    p_yes = probability_from_logits(steps[step][b], ctx.yes_pos, ctx.no_pos)
+                if status == "impure":
+                    n_impure += 1
+
+                rec = {
+                    "ecg_id": batch["ecg_id"][b],
+                    "superclass": batch["superclass"][b],
+                    "strat_fold": batch["strat_fold"][b],
+                    "split": split,
+                    "label": batch["label"][b],
+                    # the same regex that parsed the teacher's targets
+                    "parsed_conclusion": teacher_parse._extract_conclusion(text),
+                    "p_yes": p_yes,
+                    "conclusion_token": token_text,
+                    "conclusion_token_status": status,
+                    "conclusion_step": step,
+                    "n_generated_tokens": len(gen_ids),
+                    "stopped_at_end": END_MARKER.lower() in text.lower(),
+                    "generation": text,
+                    "prompt": batch["prompt"][b],
+                    "shuffled_embeddings": bool(shuffled),
+                    "zero_latents": bool(zero_latents),
+                    "donor_ecg_id": batch["donor_ecg_id"][b] if shuffled else None,
+                    "seed": seed,
+                }
+                records.append(rec)
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                if n_printed < print_first:
+                    n_printed += 1
+                    print(f"\n--- sample {n_printed}: ecg {rec['ecg_id']} "
+                          f"{rec['superclass']} label={rec['label']} "
+                          f"parsed={rec['parsed_conclusion']} "
+                          f"p_yes={rec['p_yes'] if rec['p_yes'] is None else round(rec['p_yes'], 4)} ---")
+                    print(text)
+                    print("--- end sample ---", flush=True)
+
+            fout.flush()
+            if log_every and (bi + 1) % log_every == 0:
+                done = len(records)
+                rate = done / (time.time() - t0)
+                left = (len(indices) - done) / max(rate, 1e-9)
+                print(f"[{done:>6}/{len(indices)}] {rate:.2f} ex/s  "
+                      f"eta {left/60:.1f} min", flush=True)
+
+    elapsed = time.time() - t0
+    summarise_run(records, n_impure, elapsed)
+    print(f"\nwrote {len(records):,} generations -> {out_path}")
+    return records, n_impure, elapsed
+
+
+def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
+                       split: str, seed: int, shuffled: bool, zero_latents: bool,
+                       batch_size: int, num_workers: int = 4, max_length: int = 2048,
+                       out_path: Optional[str] = None, log_every: int = 20):
+    """Next-token loss on the real targets. No generation.
+
+    Uses training's collate, so prompt construction, target, EOS and -100 masking are
+    the ones the loss was trained under; the only difference is torch.no_grad.
+    """
+    from torch.utils.data import DataLoader, Subset
+
+    loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=make_collate_fn(ctx.tokenizer, max_length=max_length),
+    )
+    print(f"teacher-forced loss over {len(indices):,} examples, batch {batch_size}, "
+          f"max_length {max_length}"
+          + ("  [ZERO-LATENTS CONTROL]" if zero_latents else ""))
+
+    records: List[dict] = []
+    t0 = time.time()
+    for bi, batch in enumerate(loader):
+        per_example = teacher_forced_batch(ctx.model, ctx.resampler, batch, ctx.dev,
+                                           zero_latents=zero_latents)
+        for b, (loss, n_tok) in enumerate(per_example):
+            records.append({
+                "ecg_id": batch["ecg_id"][b],
+                "superclass": batch["superclass"][b],
+                "strat_fold": batch["strat_fold"][b],
+                "split": split,
+                "label": bool(batch["head_label"][b]),
+                "loss": loss,
+                "n_target_tokens": n_tok,
+                "shuffled_embeddings": bool(shuffled),
+                "zero_latents": bool(zero_latents),
+                "seed": seed,
+            })
+        if log_every and (bi + 1) % log_every == 0:
+            rate = len(records) / (time.time() - t0)
+            print(f"[{len(records):>6}/{len(indices)}] {rate:.2f} ex/s", flush=True)
+
+    elapsed = time.time() - t0
+    print(f"\nteacher-forced pass over {len(records):,} examples in {elapsed/60:.1f} min")
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"wrote per-example losses -> {out_path}")
+    return records, elapsed
+
+
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def build_data_config(args) -> DatasetConfig:
+    cfg_kwargs = {}
+    if args.emb_cache:
+        cfg_kwargs["emb_cache_dir"] = args.emb_cache
+    if args.manifest:
+        cfg_kwargs["manifest_path"] = args.manifest
+    if args.teacher:
+        cfg_kwargs["teacher_path"] = args.teacher
+    return DatasetConfig(**cfg_kwargs)
+
+
 def main():
     args = parse_args()
 
@@ -678,52 +1072,59 @@ def main():
     args.out = args.out or default_out_path(args)
     metrics_out = args.metrics_out or (os.path.splitext(args.out)[0] + ".metrics.json")
 
-    cfg_kwargs = {}
-    if args.emb_cache:
-        cfg_kwargs["emb_cache_dir"] = args.emb_cache
-    if args.manifest:
-        cfg_kwargs["manifest_path"] = args.manifest
-    if args.teacher:
-        cfg_kwargs["teacher_path"] = args.teacher
-    data_cfg = DatasetConfig(**cfg_kwargs)
-
+    data_cfg = build_data_config(args)
     preflight(args, data_cfg)
-    done_keys, mode = check_resume(args)
+    done_keys, mode = ((set(), "w") if args.teacher_forced_loss else check_resume(args))
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; generation needs GPUs")
     print(f"visible GPUs: {torch.cuda.device_count()}")
     torch.manual_seed(args.seed)
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-
     # ---- data --------------------------------------------------------------
-    dataset = build_datasets(data_cfg)[args.split]
-    print(f"split {args.split}: {len(dataset):,} examples "
-          f"({len({e.ecg_id for e in dataset.examples}):,} records)")
-
+    dataset = load_split(data_cfg, args.split)
     if args.shuffle_embeddings:
-        dataset = ShuffledEmbeddings(dataset, args.seed)
-        print("*** SHUFFLE-EMBEDDINGS CONTROL ACTIVE ***")
-        print(f"    ECG embeddings permuted across {len(dataset.mapping):,} records "
-              f"within the split, SEED {args.seed}, "
-              f"{dataset.n_fixed_points} record(s) kept their own embedding")
-        print("    prompts and labels are untouched: every question is asked about "
-              "another record's ECG")
+        dataset = apply_shuffle(dataset, args.seed)
+    if args.zero_latents:
+        print("*** ZERO-LATENTS CONTROL ACTIVE ***")
+        print("    the resampler still runs; its output is replaced by zeros of the "
+              "same shape before the splice, so the 64-position prefix is present "
+              "and attendable but carries nothing")
 
     indices = list(range(len(dataset)))
     if args.limit is not None:
         indices = indices[:args.limit]
         print(f"--limit {args.limit}: evaluating {len(indices):,} examples")
 
-    base_for_meta = dataset.base if isinstance(dataset, ShuffledEmbeddings) else dataset
+    # ---- teacher-forced loss: no generation --------------------------------
+    if args.teacher_forced_loss:
+        ctx = EvalContext.load(args.model_dir, args.ckpt)
+        records, elapsed = run_teacher_forced(
+            ctx, dataset, indices, split=args.split, seed=args.seed,
+            shuffled=args.shuffle_embeddings, zero_latents=args.zero_latents,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            max_length=args.max_length, out_path=args.out, log_every=args.log_every,
+        )
+        summary = summarise_teacher_forced(records)
+        print_teacher_forced(summary)
+        with open(metrics_out, "w") as f:
+            json.dump({
+                "mode": "teacher_forced_loss",
+                "split": args.split, "checkpoint": args.ckpt, "model_dir": args.model_dir,
+                "shuffle_embeddings": bool(args.shuffle_embeddings),
+                "zero_latents": bool(args.zero_latents),
+                "seed": args.seed, "limit": args.limit, "batch_size": args.batch_size,
+                "max_length": args.max_length, "losses": args.out,
+                "elapsed_seconds": round(elapsed, 1), "teacher_forced": summary,
+            }, f, indent=2)
+        print(f"wrote {metrics_out}")
+        return
+
+    # ---- generation --------------------------------------------------------
+    meta = base_of(dataset)
     if done_keys:
         indices = [
             i for i in indices
-            if (base_for_meta.examples[i].ecg_id, base_for_meta.examples[i].superclass)
-            not in done_keys
+            if (meta.examples[i].ecg_id, meta.examples[i].superclass) not in done_keys
         ]
         print(f"{len(indices):,} example(s) left to generate")
     if not indices:
@@ -737,102 +1138,14 @@ def main():
         print(f"wrote {metrics_out}")
         return
 
-    from torch.utils.data import DataLoader, Subset
-    loader = DataLoader(
-        Subset(dataset, indices),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=make_eval_collate(tokenizer, args.max_prompt_length),
+    ctx = EvalContext.load(args.model_dir, args.ckpt)
+    records, n_impure, elapsed = run_generation(
+        ctx, dataset, indices, args.out, split=args.split, seed=args.seed,
+        shuffled=args.shuffle_embeddings, zero_latents=args.zero_latents,
+        max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
+        num_workers=args.num_workers, max_prompt_length=args.max_prompt_length,
+        print_first=args.print_first, log_every=args.log_every, mode=mode,
     )
-
-    # ---- model -------------------------------------------------------------
-    print("loading frozen student (bf16, device_map=auto) ...")
-    model = load_student(args.model_dir)
-    model.config.use_cache = True   # load_student turns it off for the backward pass
-    dev = next(model.get_input_embeddings().parameters()).device
-    resampler = load_resampler(args.ckpt, dev)
-
-    yes_ids, no_ids = yes_no_token_ids(tokenizer)
-    cand_ids = yes_ids + no_ids
-    yes_pos = list(range(len(yes_ids)))
-    no_pos = list(range(len(yes_ids), len(cand_ids)))
-    print(f"Yes token ids {yes_ids} -> {[tokenizer.decode([i]) for i in yes_ids]}")
-    print(f"No  token ids {no_ids} -> {[tokenizer.decode([i]) for i in no_ids]}")
-    capture = ConclusionLogitCapture(cand_ids, dev)
-    from transformers import LogitsProcessorList
-    processors = LogitsProcessorList([capture])
-
-    gen_config = build_generation_config(args.max_new_tokens, eos_id, pad_id)
-    print(f"greedy decoding, max_new_tokens={args.max_new_tokens}, stop at "
-          f"{END_MARKER}, batch {args.batch_size}; decoding config set explicitly "
-          f"(repetition_penalty {gen_config.repetition_penalty}, "
-          f"do_sample {gen_config.do_sample})")
-
-    # ---- generate ----------------------------------------------------------
-    records: List[dict] = []
-    n_impure = 0
-    n_printed = 0
-    t0 = time.time()
-    with open(args.out, mode, encoding="utf-8") as fout:
-        for bi, batch in enumerate(loader):
-            sequences = generate_batch(model, resampler, tokenizer, batch, dev,
-                                       processors, capture, gen_config)
-            steps = capture.steps      # steps[t][b] = logits over cand_ids at step t
-            for b in range(sequences.shape[0]):
-                gen_ids = trim_generated(sequences[b].tolist(), eos_id, pad_id)
-                text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                step, token_text, status = locate_conclusion(tokenizer, gen_ids)
-
-                p_yes = None
-                if step is not None and step < len(steps):
-                    p_yes = probability_from_logits(steps[step][b], yes_pos, no_pos)
-                if status == "impure":
-                    n_impure += 1
-
-                rec = {
-                    "ecg_id": batch["ecg_id"][b],
-                    "superclass": batch["superclass"][b],
-                    "strat_fold": batch["strat_fold"][b],
-                    "split": args.split,
-                    "label": batch["label"][b],
-                    # the same regex that parsed the teacher's targets
-                    "parsed_conclusion": teacher_parse._extract_conclusion(text),
-                    "p_yes": p_yes,
-                    "conclusion_token": token_text,
-                    "conclusion_token_status": status,
-                    "conclusion_step": step,
-                    "n_generated_tokens": len(gen_ids),
-                    "stopped_at_end": END_MARKER.lower() in text.lower(),
-                    "generation": text,
-                    "prompt": batch["prompt"][b],
-                    "shuffled_embeddings": bool(args.shuffle_embeddings),
-                    "donor_ecg_id": batch["donor_ecg_id"][b] if args.shuffle_embeddings else None,
-                    "seed": args.seed,
-                }
-                records.append(rec)
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-                if n_printed < args.print_first:
-                    n_printed += 1
-                    print(f"\n--- sample {n_printed}: ecg {rec['ecg_id']} "
-                          f"{rec['superclass']} label={rec['label']} "
-                          f"parsed={rec['parsed_conclusion']} "
-                          f"p_yes={rec['p_yes'] if rec['p_yes'] is None else round(rec['p_yes'], 4)} ---")
-                    print(text)
-                    print("--- end sample ---", flush=True)
-
-            fout.flush()
-            if (bi + 1) % args.log_every == 0:
-                done = len(records)
-                rate = done / (time.time() - t0)
-                left = (len(indices) - done) / max(rate, 1e-9)
-                print(f"[{done:>6}/{len(indices)}] {rate:.2f} ex/s  "
-                      f"eta {left/60:.1f} min", flush=True)
-
-    elapsed = time.time() - t0
-    summarise_run(records, n_impure, elapsed)
-    print(f"\nwrote {len(records):,} generations -> {args.out}")
 
     # ---- metrics -----------------------------------------------------------
     all_records = read_jsonl(args.out) if args.resume else records
@@ -840,10 +1153,12 @@ def main():
     print_metrics(table)
 
     payload = {
+        "mode": "generation",
         "split": args.split,
         "checkpoint": args.ckpt,
         "model_dir": args.model_dir,
         "shuffle_embeddings": bool(args.shuffle_embeddings),
+        "zero_latents": bool(args.zero_latents),
         "seed": args.seed,
         "limit": args.limit,
         "max_new_tokens": args.max_new_tokens,
