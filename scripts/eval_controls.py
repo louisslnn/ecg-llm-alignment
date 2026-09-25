@@ -23,6 +23,12 @@ all and the resampler may as well not be there. Identical text across conditions
 the honest failure signal that per-condition metrics can hide, because three
 conditions can each post a respectable F1 while writing the same sentence.
 
+Each pass also prints, for its first batch, the norm of the spliced latents against
+the mean norm of the token embeddings they sit next to. Read that before the table:
+if the prefix is an order of magnitude shorter than the tokens, it draws almost no
+attention weight, and identical generations across conditions are explained by scale
+alone -- no amount of training signal in the latents will show up downstream.
+
 Defaults are deliberately small -- 50 examples per generation condition at batch 1,
 200 for the teacher-forced pass -- because this is a diagnostic, not the evaluation.
 Batch 1 keeps each condition's decode independent of how the batch happened to be

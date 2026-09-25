@@ -43,6 +43,13 @@ prompts and labels exactly as they are:
 Metrics that survive either control were never coming from the signal -- they are
 the label prior plus whatever age and sex leak through the question.
 
+Every pass also prints, for its first batch, the L2 norm of the spliced latents next
+to the mean norm of the token embeddings they sit against. Differing latents are not
+enough: attention logits are dot products, so a prefix an order of magnitude shorter
+than the tokens draws almost no attention weight and the frozen LLM reads past it.
+That ratio says whether the prefix can compete for attention at all, and it is the
+first thing to check when the controls come back indistinguishable.
+
 ``--teacher-forced-loss`` is the other half of the picture and generates nothing.
 It builds the same prompts, appends the real teacher target, and computes the
 next-token loss under training's masking (prompt, padding and latents at -100, loss
@@ -565,7 +572,59 @@ def build_generation_config(max_new_tokens: int, eos_id: int, pad_id: int):
     )
 
 
-def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False):
+def prefix_scale_report(latents, tok_embeds, attn, label="prompt"):
+    """Print the size of the spliced prefix next to the tokens it sits against.
+
+    Whether the latents differ from each other is not enough: they also have to be
+    LOUD enough to matter. Attention logits are query-key dot products, so a prefix
+    whose vectors are an order of magnitude shorter than the token embeddings
+    contributes correspondingly smaller logits, its softmax weight goes to ~0, and
+    the frozen LLM reads straight past it. A run can then pass every "the tensors
+    are different" check and still be text-only in effect.
+
+    Norms are per position (one L2 norm per latent, one per token), which is the
+    comparison that means something, and taken over real tokens only -- padding
+    would drag the token mean toward zero and flatter the ratio. Returns the numbers
+    as well as printing them.
+    """
+    lat = latents.detach().float().norm(dim=-1).flatten()
+    tok_norms = tok_embeds.detach().float().norm(dim=-1)
+    real = tok_norms[attn.bool()]
+    lat_mean = float(lat.mean())
+    tok_mean = float(real.mean()) if real.numel() else float("nan")
+    ratio = lat_mean / tok_mean if tok_mean else float("nan")
+
+    tok_min = float(real.min()) if real.numel() else float("nan")
+    tok_max = float(real.max()) if real.numel() else float("nan")
+    w = 26
+    print(f"\nprefix scale, first batch ({tuple(latents.shape)} latents vs "
+          f"{int(attn.sum())} real {label} tokens):")
+    print(f"  {'latent norm (per position)':<{w}} mean {lat_mean:9.3f}  "
+          f"min {float(lat.min()):9.3f}  max {float(lat.max()):9.3f}")
+    print(f"  {label + ' token norm':<{w}} mean {tok_mean:9.3f}  "
+          f"min {tok_min:9.3f}  max {tok_max:9.3f}")
+    print(f"  {'ratio latents / tokens':<{w}} {ratio:9.3g}")
+    if ratio != ratio:                      # nan: nothing real to compare against
+        print("  -> no real tokens in this batch; ratio undefined")
+    elif lat_mean == 0.0:
+        print("  -> the prefix is exactly zero (the --zero-latents control)")
+    elif ratio < 0.1:
+        print(f"  -> WARNING: the prefix is ~{1/ratio:.0f}x SHORTER than the tokens it "
+              "sits against.\n     Attention weight on it will be near zero: the "
+              "frozen LLM effectively ignores\n     the ECG however different the "
+              "latents are from one another.")
+    elif ratio > 10:
+        print(f"  -> WARNING: the prefix is ~{ratio:.0f}x LONGER than the tokens it "
+              "sits against and\n     may swamp the question rather than condition it.")
+    else:
+        print("  -> comparable scale: the prefix can compete for attention")
+    return {"latent_norm_mean": lat_mean, "latent_norm_min": float(lat.min()),
+            "latent_norm_max": float(lat.max()), "token_norm_mean": tok_mean,
+            "ratio": ratio}
+
+
+def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False,
+                  report_label=None):
     """Token embeddings with the resampler's latents spliced in front.
 
     The splice is the training splice (scripts/probe_memory.py splice_forward):
@@ -576,6 +635,9 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
     of the same shape. Zeroing AFTER the forward pass rather than skipping it keeps
     the prefix the same width and the tensor path identical, so the only thing that
     changes is whether the prefix carries information.
+
+    ``report_label`` prints the prefix-vs-token norm comparison for this batch; the
+    callers pass it on the first batch only.
     """
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
@@ -585,6 +647,9 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
     # torch.cat needs one dtype; autocast can hand back fp32 from a LayerNorm-final
     # path, and the student runs in bf16 regardless.
     latents = latents.to(tok_embeds.dtype)
+
+    if report_label:
+        prefix_scale_report(latents, tok_embeds, attn, label=report_label)
 
     B, Lq, _ = latents.shape
     full_embeds = torch.cat([latents, tok_embeds], dim=1)
@@ -596,7 +661,7 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
 
 @torch.no_grad()
 def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
-                   gen_config, zero_latents=False):
+                   gen_config, zero_latents=False, report_label=None):
     """One batch: splice latents in front of the prompt, then greedy-decode to <END>.
 
     Left padding means the pads sit between the latents and the real prompt; position
@@ -606,6 +671,7 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
     full_embeds, full_attn, _ = splice_prefix(
         model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
         batch["attention_mask"].to(dev), dev, zero_latents=zero_latents,
+        report_label=report_label,
     )
 
     capture.reset()
@@ -621,7 +687,8 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
 
 
 @torch.no_grad()
-def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False):
+def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
+                         report_label=None):
     """Per-example next-token loss on the real target. Returns [(loss, n_tokens)].
 
     The batch comes from training's own collate (``src.data.dataset.make_collate_fn``),
@@ -637,7 +704,7 @@ def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False):
     attn = batch["attention_mask"].to(dev)
     full_embeds, full_attn, Lq = splice_prefix(
         model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
-        attn, dev, zero_latents=zero_latents,
+        attn, dev, zero_latents=zero_latents, report_label=report_label,
     )
     B = labels.shape[0]
     full_labels = torch.cat(
@@ -922,7 +989,9 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
         for bi, batch in enumerate(loader):
             sequences = generate_batch(ctx.model, ctx.resampler, ctx.tokenizer, batch,
                                        ctx.dev, ctx.processors, ctx.capture, gen_config,
-                                       zero_latents=zero_latents)
+                                       zero_latents=zero_latents,
+                                       # the prefix-scale check, once per pass
+                                       report_label="prompt" if bi == 0 else None)
             steps = ctx.capture.steps   # steps[t][b] = logits over cand_ids at step t
             for b in range(sequences.shape[0]):
                 gen_ids = trim_generated(sequences[b].tolist(), ctx.eos_id, ctx.pad_id)
@@ -1008,7 +1077,10 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
     t0 = time.time()
     for bi, batch in enumerate(loader):
         per_example = teacher_forced_batch(ctx.model, ctx.resampler, batch, ctx.dev,
-                                           zero_latents=zero_latents)
+                                           zero_latents=zero_latents,
+                                           # the prefix-scale check, once per pass
+                                           report_label=("prompt+target" if bi == 0
+                                                         else None))
         for b, (loss, n_tok) in enumerate(per_example):
             records.append({
                 "ecg_id": batch["ecg_id"][b],
