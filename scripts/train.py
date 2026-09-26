@@ -40,7 +40,11 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for probe_memory
 
 from src.data.dataset import DatasetConfig, build_datasets, make_collate_fn  # noqa: E402
-from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
+from src.model.resampler import (  # noqa: E402
+    PerceiverResamplerConfig,
+    Resampler,
+    mean_embedding_norm,
+)
 from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
     GradFlowError,
     check_gradients,
@@ -347,6 +351,16 @@ def main():
     dev = next(model.get_input_embeddings().parameters()).device
 
     resampler = Resampler(PerceiverResamplerConfig.ecg()).to(dev)
+    # Start the latents at the student's own embedding scale. The splice puts them
+    # in front of real token embeddings, and attention logits are dot products, so
+    # a prefix far shorter than those embeddings draws almost no attention weight
+    # and the frozen LLM reads past the ECG. This only sets where training starts:
+    # the LayerNorm gain trains like any other parameter, and on resume the
+    # checkpoint's learned value replaces it (resume() loads after this).
+    target = mean_embedding_norm(model.get_input_embeddings().weight)
+    gain = resampler.calibrate_from_embeddings(model.get_input_embeddings().weight)
+    print(f"student mean embedding norm: {target:.4f}; output LayerNorm gain set to "
+          f"{gain:.6f} (= {target:.4f} / sqrt({resampler.config.embed_dim}))")
     resampler.train()
     n_train = sum(p.numel() for p in resampler.parameters() if p.requires_grad)
     n_frozen_grad = sum(1 for p in model.parameters() if p.requires_grad)

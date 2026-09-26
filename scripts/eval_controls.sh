@@ -36,11 +36,16 @@ module load StdEnv/2023 python/3.11 cuda
 PROJECT_DIR="${PROJECT_DIR:-$HOME/projects/ctb-liyue/$USER/ecg-llm-alignment}"
 VENV="${VENV:-$PROJECT_DIR/venv}"
 MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/hf_cache/DeepSeek-R1-Distill-Qwen-14B}"
-# Checkpoints are written to scratch by train.sh; best.pt is the lowest val loss.
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints}"
+# Checkpoints are written to scratch by train.sh, one directory per RUN; best.pt
+# is the lowest val loss. RUN must match the training run you mean to evaluate --
+# the default follows train.sh's default, so `sbatch scripts/train.sh` and this
+# script agree without being told. Run 1 predates the convention and sits in the
+# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
+RUN="${RUN:-run2}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN}"
 CKPT="${CKPT:-$CKPT_DIR/best.pt}"
 # Outputs land on scratch too (project space is at its file quota).
-EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval}"
+EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval/$RUN}"
 SPLIT="${SPLIT:-test}"
 LIMIT="${LIMIT:-50}"
 TF_LIMIT="${TF_LIMIT:-200}"
@@ -51,7 +56,7 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1   # no network on compute nodes
 mkdir -p "$EVAL_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
-echo "host: $(hostname)   model: $MODEL_DIR   ckpt: $CKPT   out: $EVAL_DIR"
+echo "host: $(hostname)   run: $RUN   ckpt: $CKPT   out: $EVAL_DIR"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 # "$@" is appended last, so anything passed to sbatch overrides these defaults.

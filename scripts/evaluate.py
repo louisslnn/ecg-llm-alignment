@@ -94,6 +94,7 @@ local_files_only=True.
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -529,7 +530,13 @@ def load_resampler(ckpt_path: str, dev) -> Resampler:
     # weights_only=True default (torch>=2.6) refuses to unpickle.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = payload["resampler"] if isinstance(payload, dict) and "resampler" in payload else payload
-    resampler = Resampler(PerceiverResamplerConfig.ecg())
+    # The checkpoint is the authority on its own architecture: a run trained before
+    # these norms existed (or with either flag off) has no output_norm.* / input_norm.*
+    # keys, and building them anyway would fail the strict load.
+    has_output_norm = any(k.startswith("output_norm.") for k in state)
+    has_input_norm = any(k.startswith("input_norm.") for k in state)
+    resampler = Resampler(PerceiverResamplerConfig.ecg(
+        final_output_norm=has_output_norm, input_layer_norm=has_input_norm))
     resampler.load_state_dict(state, strict=True)   # strict: a silently partial load
     resampler = resampler.to(dev).eval()            # would evaluate a half-random model
     for p in resampler.parameters():
@@ -540,6 +547,17 @@ def load_resampler(ckpt_path: str, dev) -> Resampler:
               f"best_val {payload.get('best_val_loss')}")
     else:
         print(f"resampler from {ckpt_path} (bare state dict)")
+    if has_output_norm:
+        gain = float(resampler.output_norm.weight.mean())
+        print(f"  final output LayerNorm present; mean gain {gain:.6f} "
+              f"(implies a target latent norm of "
+              f"{gain * math.sqrt(resampler.config.embed_dim):.3f})")
+    else:
+        print("  no final output LayerNorm in this checkpoint (reference behaviour); "
+              "watch the prefix-scale ratio below")
+    if not has_input_norm:
+        print("  no input LayerNorm in this checkpoint: bio_projection sees the raw "
+              "~350-norm ECG cache (reference behaviour)")
     return resampler
 
 

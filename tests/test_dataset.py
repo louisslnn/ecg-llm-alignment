@@ -21,16 +21,28 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from src.data.dataset import (
+    DEFAULT_PREFIX_TEXT,
     DatasetConfig,
+    _format_prompt,
     build_datasets,
     load_student_tokenizer,
     make_collate_fn,
+    student_prompt,
 )
 from src.teacher.postprocess import is_leak_step
 from src.teacher.prompt import superclass_answer
 from src.teacher.view import build_view
 
 CONFIG = DatasetConfig(debug=True)
+
+
+def _skip(reason: str) -> None:
+    """Skip under pytest, report and continue when run as a script."""
+    print(f"SKIP: {reason}")
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        import pytest
+
+        pytest.skip(reason)
 
 # Expected exclusion accounting over parsed_final (full_v6_final.jsonl, after the
 # regen merge + report-reference rewrite). The regen fixed almost all the gaps.
@@ -175,6 +187,69 @@ def test_label_matches_manifest_superclass_answer():
         rec = ds.manifest[item["ecg_id"]]
         expected = superclass_answer(build_view(rec), item["superclass"])
         assert item["label"] == expected, (item["ecg_id"], item["superclass"])
+
+
+class _ThinkTemplateTokenizer:
+    """Minimal stand-in for a reasoning tokenizer: its generation prompt opens
+    a think block, exactly as DeepSeek-R1-Distill's template does."""
+
+    chat_template = "yes"
+
+    def apply_chat_template(self, messages, add_generation_prompt=False, tokenize=False):
+        text = f"<|User|>{messages[0]['content']}"
+        if add_generation_prompt:
+            text += "<|Assistant|><think>\n"
+        return text
+
+
+def test_format_prompt_strips_the_trailing_think_block():
+    """The rendered prompt must end at the assistant tag, think block removed."""
+    tok = _ThinkTemplateTokenizer()
+    out = _format_prompt(tok, "Is this a normal ECG?")
+    assert out.endswith("<|Assistant|>"), repr(out)
+    assert "<think>" not in out
+
+    # Only a TRAILING open block goes; the same text inside the user's own content
+    # is content, not template scaffolding.
+    keep = _format_prompt(tok, "the report mentions <think> verbatim")
+    assert "<think> verbatim" in keep
+    assert keep.endswith("<|Assistant|>")
+
+
+def test_masked_prompt_decodes_without_a_think_block():
+    """Decode the masked (label == -100) span and assert no open think block.
+
+    Run against the REAL student tokenizer, since the think block comes from its
+    template and the debug 0.5B has none. This is the check that matters: whatever
+    the template renders, what the model is actually conditioned on -- the tokens
+    the loss does not supervise -- must contain no unclosed <think>.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        tok = AutoTokenizer.from_pretrained(
+            DatasetConfig().student_model, local_files_only=True
+        )
+    except Exception as err:                     # checkpoint not on this machine
+        _skip(f"student tokenizer unavailable ({type(err).__name__}); "
+              "run where MODEL_DIR is present")
+        return
+
+    ds = splits()["train"]
+    batch = make_collate_fn(tok, max_length=2048)([ds[0], ds[1], ds[2]])
+    input_ids, labels, attn = batch["input_ids"], batch["labels"], batch["attention_mask"]
+
+    for r in range(input_ids.shape[0]):
+        masked = (labels[r] == -100) & (attn[r] == 1)      # the prompt, not padding
+        prompt_text = tok.decode(input_ids[r][masked], skip_special_tokens=False)
+        assert "<think>" not in prompt_text, prompt_text[-120:]
+        assert "</think>" not in prompt_text
+        # and it ends where the assistant's turn begins, with nothing after it
+        assert prompt_text.rstrip().endswith("<｜Assistant｜>"), prompt_text[-120:]
+
+        # the supervised span is the target, and it carries no think markup either
+        target_text = tok.decode(input_ids[r][labels[r] != -100], skip_special_tokens=False)
+        assert "think" not in target_text.lower()
 
 
 def test_collate_masks_prompt_tokens_only():

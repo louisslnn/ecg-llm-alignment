@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -419,14 +420,32 @@ def load_student_tokenizer(config: Optional[DatasetConfig] = None):
     return AutoTokenizer.from_pretrained(config.student_model_name)
 
 
+# A reasoning template's generation prompt opens a think block that our targets
+# never close. DeepSeek-R1-Distill renders "<|Assistant|><think>\n" (real tokens:
+# <｜Assistant｜>, <think>, \n), so without this the student is asked to start
+# inside a think block and then emit Evidence/Reasoning/Conclusion/<END> + EOS with
+# no </think> anywhere -- a format it was distilled never to produce, and one the
+# loss then teaches it to produce. ChatHealthAI removes the block (confirmed with
+# Bo Hong), so the prompt ends at the assistant tag and the target starts there.
+# Anchored to the very end of the string, so a "<think>" inside user content is
+# left alone; a no-op for templates that add none (e.g. the 0.5B debug student).
+_TRAILING_THINK_RE = re.compile(r"<think>\s*\Z")
+
+
 def _format_prompt(tokenizer, user_content: str) -> str:
-    """Wrap the student prompt in the chat template, turn left open for the target."""
+    """Wrap the student prompt in the chat template, turn left open for the target.
+
+    The rendered prompt ends at the assistant tag with NO open think block; see
+    :data:`_TRAILING_THINK_RE`. Training and evaluation both build prompts here, so
+    they cannot drift apart on this.
+    """
     if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
+        rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": user_content}],
             add_generation_prompt=True,
             tokenize=False,
         )
+        return _TRAILING_THINK_RE.sub("", rendered)
     return f"<|user|>\n{user_content}\n<|assistant|>\n"
 
 
