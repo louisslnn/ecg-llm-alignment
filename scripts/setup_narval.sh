@@ -11,21 +11,34 @@
 #   bash scripts/setup_narval.sh
 #
 # Override any path with an env var, e.g.:
-#   PROJECT_DIR=/project/def-liyue/$USER/ecg bash scripts/setup_narval.sh
+#   ECG_DIR=/project/def-liyue/$USER/ecg bash scripts/setup_narval.sh
 set -euo pipefail
 
 module load StdEnv/2023 python/3.11 cuda
 
-# --- paths (all under project space, which is quota'd and backed up) ----------
-PROJECT_DIR="${PROJECT_DIR:-$HOME/projects/def-liyue/$USER/ecg-llm-alignment}"
-VENV="${VENV:-$PROJECT_DIR/venv}"
-HF_CACHE="${HF_CACHE:-$PROJECT_DIR/hf_cache}"
-LOCK="${LOCK:-$PROJECT_DIR/requirements-narval.lock}"
+# --- paths -------------------------------------------------------------------
+# On scratch, not project space: the checkpoint alone is ~28 GB of safetensors and
+# /project is at its file quota. Scratch is purgeable, so if the files age out this
+# script is what rebuilds them. These defaults are the ones every scripts/*.sh job
+# script looks for -- change them here and there together.
+ECG_DIR="${ECG_DIR:-$HOME/scratch/ecg}"
+VENV="${VENV:-$ECG_DIR/venv}"
+HF_CACHE="${HF_CACHE:-$ECG_DIR/hf_cache}"
+LOCK="${LOCK:-$ECG_DIR/requirements-narval.lock}"
 
 MODEL_ID="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 MODEL_DIR="$HF_CACHE/DeepSeek-R1-Distill-Qwen-14B"
 
-mkdir -p "$PROJECT_DIR" "$HF_CACHE"
+# This script CREATES these paths, so it gets no missing-path check -- unlike the
+# job scripts, which refuse to start without them. It does refuse to overwrite an
+# existing venv, since virtualenv over a live one leaves it half-rebuilt.
+if [[ -e "$VENV" ]]; then
+    echo "a venv already exists at $VENV" >&2
+    echo "delete it to rebuild, or pass VENV=... for a second one" >&2
+    exit 2
+fi
+
+mkdir -p "$ECG_DIR" "$HF_CACHE"
 
 # --- 1. virtualenv from the Alliance wheelhouse ------------------------------
 echo "== creating venv at $VENV =="
