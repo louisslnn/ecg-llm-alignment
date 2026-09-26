@@ -202,22 +202,56 @@ class _ThinkTemplateTokenizer:
         return text
 
 
-def test_format_prompt_strips_the_trailing_think_block():
-    """The rendered prompt must end at the assistant tag, think block removed."""
+def test_think_block_is_kept_by_default():
+    """OFF by default: the prompt must stay byte-identical to what run 1 trained on.
+
+    The sweep varies the prefix scale alone, so a silent prompt change here would
+    make every comparison against run 1 meaningless.
+    """
+    assert DatasetConfig().strip_think is False
     tok = _ThinkTemplateTokenizer()
-    out = _format_prompt(tok, "Is this a normal ECG?")
+    assert _format_prompt(tok, "Is this a normal ECG?").endswith("<|Assistant|><think>\n")
+
+
+def test_format_prompt_strips_the_trailing_think_block_when_asked():
+    """With strip_think the prompt ends at the assistant tag, think block removed."""
+    tok = _ThinkTemplateTokenizer()
+    out = _format_prompt(tok, "Is this a normal ECG?", strip_think=True)
     assert out.endswith("<|Assistant|>"), repr(out)
     assert "<think>" not in out
 
     # Only a TRAILING open block goes; the same text inside the user's own content
     # is content, not template scaffolding.
-    keep = _format_prompt(tok, "the report mentions <think> verbatim")
+    keep = _format_prompt(tok, "the report mentions <think> verbatim", strip_think=True)
     assert "<think> verbatim" in keep
     assert keep.endswith("<|Assistant|>")
 
 
+def test_collate_forwards_strip_think():
+    """The flag has to reach the tokenised prompt, not just _format_prompt."""
+    ds = splits()["train"]
+    tok = load_student_tokenizer(CONFIG)          # the 0.5B has no think block, so
+    collate = make_collate_fn(tok, max_length=512, strip_think=True)   # assert on the
+    batch = collate([ds[0]])                                          # call path only
+    assert batch["input_ids"].shape[0] == 1
+
+    calls = []
+    real = _format_prompt
+
+    class _Spy:
+        chat_template = "yes"
+
+        def apply_chat_template(self, messages, add_generation_prompt=False,
+                                tokenize=False):
+            return f"<|User|>{messages[0]['content']}<|Assistant|><think>\n"
+
+    for flag in (False, True):
+        calls.append(real(_Spy(), "q", strip_think=flag))
+    assert calls[0].endswith("<think>\n") and calls[1].endswith("<|Assistant|>")
+
+
 def test_masked_prompt_decodes_without_a_think_block():
-    """Decode the masked (label == -100) span and assert no open think block.
+    """With strip_think ON, decode the masked (label == -100) span: no think block.
 
     Run against the REAL student tokenizer, since the think block comes from its
     template and the debug 0.5B has none. This is the check that matters: whatever
@@ -236,7 +270,8 @@ def test_masked_prompt_decodes_without_a_think_block():
         return
 
     ds = splits()["train"]
-    batch = make_collate_fn(tok, max_length=2048)([ds[0], ds[1], ds[2]])
+    batch = make_collate_fn(tok, max_length=2048, strip_think=True)(
+        [ds[0], ds[1], ds[2]])
     input_ids, labels, attn = batch["input_ids"], batch["labels"], batch["attention_mask"]
 
     for r in range(input_ids.shape[0]):

@@ -72,12 +72,26 @@ def parse_args():
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-length", type=int, default=2048)  # MAX_TEXT_LEN
+    ap.add_argument("--prefix-scale", type=float, default=1.0,
+                    help="multiplier on the output LayerNorm's calibration target: "
+                         "the gain becomes (scale * mean_embedding_norm) / "
+                         "sqrt(embed_dim). 1.0 puts the latents exactly on the "
+                         "student's embedding scale; >1 makes the prefix louder. This "
+                         "is the swept variable -- see scripts/gate_scale.sh")
+    ap.add_argument("--strip-think", action="store_true",
+                    help="strip the template's trailing open <think> block from the "
+                         "prompt. OFF by default, matching run 1; evaluation must be "
+                         "given the same flag or the student is scored on a prompt it "
+                         "never saw")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--grad-checkpointing", choices=["on", "off"], default="off",
                     help="LLM activation checkpointing; off by default -- the probe "
                          "showed batch 4 fits (28.5/21.0 GiB) and measured it a no-op")
     # cadence
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--prefix-log-every", type=int, default=50,
+                    help="in --overfit mode, log the latent/token norm ratio and "
+                         "||gain|| every N steps, to see the trainable gain drift")
     ap.add_argument("--ckpt-every", type=int, default=1000)
     # the gate
     ap.add_argument("--overfit", type=int, default=None,
@@ -102,6 +116,11 @@ def set_seed(seed):
 # before the time limit / on preemption). The training loop checkpoints and exits at
 # the next step boundary, so --requeue restarts from a fresh checkpoint.
 _PREEMPT = {"flag": False}
+
+# Settings written into every checkpoint, filled in by main(). A prefix-scale sweep
+# yields checkpoints whose weights differ only through one scalar; without this there
+# is nothing in the file that says which run produced it.
+_RUN_META: dict = {}
 
 
 def _install_signal_handlers():
@@ -141,13 +160,17 @@ def _rotating(ckpt_dir):
                   key=lambda p: int(_STEP_RE.search(p).group(1)))
 
 
-def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_best):
+def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_best,
+                    meta=None):
     payload = {
         "resampler": resampler.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "global_step": step,
         "best_val_loss": best_val,
+        # what this run was: a sweep over prefix_scale produces checkpoints that are
+        # otherwise indistinguishable, so each one carries its own settings
+        "meta": dict(_RUN_META) if meta is None else meta,
         "rng": {
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all(),
@@ -201,7 +224,8 @@ def build_loaders(args, tokenizer, data_cfg):
     from torch.utils.data import DataLoader, Subset
 
     splits = build_datasets(data_cfg)
-    collate = make_collate_fn(tokenizer, max_length=args.max_length)
+    collate = make_collate_fn(tokenizer, max_length=args.max_length,
+                              strip_think=data_cfg.strip_think)
     g = torch.Generator()
     g.manual_seed(args.seed)
 
@@ -241,6 +265,37 @@ def _log_mem():
     return "  ".join(f"gpu{i} {p:.1f}GiB" for i, p in enumerate(gpu_peaks()))
 
 
+@torch.no_grad()
+def prefix_scale_line(model, resampler, batch, dev):
+    """Where the prefix actually sits, relative to the tokens it is spliced against.
+
+    The LayerNorm gain is initialised to put the latents on the student's embedding
+    scale (times --prefix-scale), but it is a trainable parameter: this measures
+    where it has drifted to. Reports the mean per-position latent norm, the mean norm
+    of the real prompt/target tokens, their ratio, and ||gain||, which is what the
+    latent norm reduces to when the normalised vectors have unit variance -- so a
+    gap between ||gain|| and the measured norm says the latents are not unit-variance
+    going into the norm, and movement in ||gain|| alone is the optimiser pulling the
+    prefix louder or quieter than it was initialised.
+
+    Mirrors the resampler call in probe_memory.splice_forward; one extra resampler
+    forward, no LLM forward, so it is cheap next to a training step.
+    """
+    ecg = batch["ecg_embed"].to(dev)
+    input_ids = batch["input_ids"].to(dev)
+    attn = batch["attention_mask"].to(dev)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        tok_embeds = model.get_input_embeddings()(input_ids)
+        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=attn.bool())
+    lat = float(latents.float().norm(dim=-1).mean())
+    tok = float(tok_embeds.float().norm(dim=-1)[attn.bool()].mean())
+    out_norm = getattr(resampler, "output_norm", None)
+    gain = (f"  ||gain|| {float(out_norm.weight.detach().float().norm()):.3f}"
+            if out_norm is not None else "")
+    return (f"latents {lat:.3f}  tokens {tok:.3f}  ratio {lat / max(tok, 1e-9):.3f}"
+            + gain)
+
+
 def train_overfit(model, resampler, optimizer, loader, dev, args):
     print(f"gate: overfit to loss <= {args.overfit_target_loss} within "
           f"{args.overfit_max_steps} steps")
@@ -262,6 +317,9 @@ def train_overfit(model, resampler, optimizer, loader, dev, args):
             lv = float(loss.detach())
             print(f"step {step:5d}  loss {lv:.4f}  {time.time()-t0:.2f}s  {_log_mem()}",
                   flush=True)
+            if step == 1 or step % args.prefix_log_every == 0:
+                print(f"    prefix scale @ step {step}: "
+                      f"{prefix_scale_line(model, resampler, batch, dev)}", flush=True)
             if lv <= args.overfit_target_loss:
                 print(f"GATE PASSED: loss {lv:.4f} <= {args.overfit_target_loss} at step {step}")
                 return True
@@ -322,10 +380,19 @@ def main():
     args = parse_args()
     if args.lr is None:                       # 1e-4 in the gate, 1e-5 for real training
         args.lr = 1e-4 if args.overfit is not None else 1e-5
+    _RUN_META.update({
+        "prefix_scale": args.prefix_scale,
+        "strip_think": bool(args.strip_think),
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "overfit": args.overfit,
+        "seed": args.seed,
+    })
     set_seed(args.seed)
     _install_signal_handlers()
 
-    cfg_kwargs = {}
+    cfg_kwargs = {"strip_think": args.strip_think}
     if args.emb_cache:
         cfg_kwargs["emb_cache_dir"] = args.emb_cache
     if args.manifest:
@@ -357,10 +424,12 @@ def main():
     # and the frozen LLM reads past the ECG. This only sets where training starts:
     # the LayerNorm gain trains like any other parameter, and on resume the
     # checkpoint's learned value replaces it (resume() loads after this).
-    target = mean_embedding_norm(model.get_input_embeddings().weight)
-    gain = resampler.calibrate_from_embeddings(model.get_input_embeddings().weight)
-    print(f"student mean embedding norm: {target:.4f}; output LayerNorm gain set to "
-          f"{gain:.6f} (= {target:.4f} / sqrt({resampler.config.embed_dim}))")
+    embed_norm = mean_embedding_norm(model.get_input_embeddings().weight)
+    target = args.prefix_scale * embed_norm
+    gain = resampler.calibrate_output_norm(target)
+    print(f"student mean embedding norm: {embed_norm:.4f}; prefix_scale "
+          f"{args.prefix_scale:g} -> target latent norm {target:.4f}; output LayerNorm "
+          f"gain set to {gain:.6f} (= {target:.4f} / sqrt({resampler.config.embed_dim}))")
     resampler.train()
     n_train = sum(p.numel() for p in resampler.parameters() if p.requires_grad)
     n_frozen_grad = sum(1 for p in model.parameters() if p.requires_grad)

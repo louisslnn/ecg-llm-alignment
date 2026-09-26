@@ -153,6 +153,15 @@ class DatasetConfig:
     manifest_path: str = os.path.join(REPO_ROOT, "data", "ptbxl", "manifest.jsonl")
     teacher_path: str = os.path.join(REPO_ROOT, "data", "teacher", "full_v6_final.jsonl")
 
+    # Strip the trailing open <think> block the reasoning template appends to the
+    # generation prompt (see :data:`_TRAILING_THINK_RE`). OFF by default: run 1
+    # trained with the block present, and every comparison against it has to keep
+    # the prompt byte-identical. Turning this on changes the prompt, so a run with
+    # it on is a different experiment, not a variation of the same one -- and it
+    # must be set the SAME WAY for training and evaluation, or the student is
+    # scored on a prompt it never saw.
+    strip_think: bool = False
+
     # The student LLM. `debug` swaps in the 0.5B model so tokenisation (and the
     # rest of the training loop) runs on CPU locally.
     debug: bool = False
@@ -432,12 +441,14 @@ def load_student_tokenizer(config: Optional[DatasetConfig] = None):
 _TRAILING_THINK_RE = re.compile(r"<think>\s*\Z")
 
 
-def _format_prompt(tokenizer, user_content: str) -> str:
+def _format_prompt(tokenizer, user_content: str, strip_think: bool = False) -> str:
     """Wrap the student prompt in the chat template, turn left open for the target.
 
-    The rendered prompt ends at the assistant tag with NO open think block; see
-    :data:`_TRAILING_THINK_RE`. Training and evaluation both build prompts here, so
-    they cannot drift apart on this.
+    With ``strip_think`` the rendered prompt ends at the assistant tag and carries no
+    open think block (see :data:`_TRAILING_THINK_RE`); without it the template's own
+    output is used verbatim, which is what run 1 trained on. Training and evaluation
+    both build prompts here, so they cannot drift apart on anything EXCEPT this flag
+    -- pass it from :class:`DatasetConfig` on both sides.
     """
     if getattr(tokenizer, "chat_template", None):
         rendered = tokenizer.apply_chat_template(
@@ -445,7 +456,7 @@ def _format_prompt(tokenizer, user_content: str) -> str:
             add_generation_prompt=True,
             tokenize=False,
         )
-        return _TRAILING_THINK_RE.sub("", rendered)
+        return _TRAILING_THINK_RE.sub("", rendered) if strip_think else rendered
     return f"<|user|>\n{user_content}\n<|assistant|>\n"
 
 
@@ -453,8 +464,12 @@ def make_collate_fn(
     tokenizer,
     max_length: int = 1024,
     prefix_text: str = DEFAULT_PREFIX_TEXT,
+    strip_think: bool = False,
 ) -> Callable[[Sequence[Dict[str, Any]]], Dict[str, Any]]:
     """Build a collate function bound to a tokenizer.
+
+    ``strip_think`` is forwarded to :func:`_format_prompt`; pass
+    ``DatasetConfig.strip_think`` so training and evaluation agree.
 
     Produces a batch dict with the embeddings stacked and the prompt+target
     tokenised into ``input_ids`` / ``attention_mask`` / ``labels``. Prompt tokens
@@ -474,7 +489,7 @@ def make_collate_fn(
         labels_list: List[List[int]] = []
         for b in batch:
             user_content = f"{prefix_text}\n\n{b['task_prompt']}"
-            prompt_str = _format_prompt(tokenizer, user_content)
+            prompt_str = _format_prompt(tokenizer, user_content, strip_think)
             prompt_ids = tokenizer(prompt_str, add_special_tokens=False).input_ids
             target_ids = tokenizer(b["target"], add_special_tokens=False).input_ids
             if eos_id is not None:

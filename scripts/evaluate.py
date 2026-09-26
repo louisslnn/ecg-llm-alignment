@@ -165,6 +165,10 @@ def parse_args():
     ap.add_argument("--max-length", type=int, default=2048,
                     help="token cap for prompt+target in --teacher-forced-loss "
                          "(training's MAX_TEXT_LEN)")
+    ap.add_argument("--strip-think", action="store_true",
+                    help="strip the template's trailing open <think> block from the "
+                         "prompt. MUST match what training used (train.py's own "
+                         "--strip-think); off by default, as run 1 trained")
     # the controls
     ap.add_argument("--shuffle-embeddings", action="store_true",
                     help="permute ECG embeddings across records within the split "
@@ -470,7 +474,7 @@ class ShuffledEmbeddings(torch.utils.data.Dataset):
         return item
 
 
-def make_eval_collate(tokenizer, max_prompt_length: int):
+def make_eval_collate(tokenizer, max_prompt_length: int, strip_think: bool = False):
     """Prompt-only collate, LEFT-padded for batched generation.
 
     Training right-pads because the target follows the prompt; generation continues
@@ -487,7 +491,7 @@ def make_eval_collate(tokenizer, max_prompt_length: int):
         prompts, ids_list = [], []
         for b in batch:
             user_content = f"{DEFAULT_PREFIX_TEXT}\n\n{b['task_prompt']}"
-            prompt_str = _format_prompt(tokenizer, user_content)
+            prompt_str = _format_prompt(tokenizer, user_content, strip_think)
             prompts.append(prompt_str)
             ids_list.append(
                 tokenizer(prompt_str, add_special_tokens=False).input_ids[:max_prompt_length]
@@ -990,7 +994,8 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=make_eval_collate(ctx.tokenizer, max_prompt_length),
+        collate_fn=make_eval_collate(ctx.tokenizer, max_prompt_length,
+                                     strip_think=base_of(dataset).config.strip_think),
     )
     gen_config = build_generation_config(max_new_tokens, ctx.eos_id, ctx.pad_id)
     print(f"greedy decoding, max_new_tokens={max_new_tokens}, stop at {END_MARKER}, "
@@ -1085,7 +1090,8 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=make_collate_fn(ctx.tokenizer, max_length=max_length),
+        collate_fn=make_collate_fn(ctx.tokenizer, max_length=max_length,
+                                   strip_think=base_of(dataset).config.strip_think),
     )
     print(f"teacher-forced loss over {len(indices):,} examples, batch {batch_size}, "
           f"max_length {max_length}"
@@ -1132,7 +1138,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
 
 
 def build_data_config(args) -> DatasetConfig:
-    cfg_kwargs = {}
+    cfg_kwargs = {"strip_think": bool(getattr(args, "strip_think", False))}
     if args.emb_cache:
         cfg_kwargs["emb_cache_dir"] = args.emb_cache
     if args.manifest:
@@ -1202,6 +1208,7 @@ def main():
                 "split": args.split, "checkpoint": args.ckpt, "model_dir": args.model_dir,
                 "shuffle_embeddings": bool(args.shuffle_embeddings),
                 "zero_latents": bool(args.zero_latents),
+                "strip_think": bool(args.strip_think),
                 "seed": args.seed, "limit": args.limit, "batch_size": args.batch_size,
                 "max_length": args.max_length, "losses": args.out,
                 "elapsed_seconds": round(elapsed, 1), "teacher_forced": summary,
@@ -1249,6 +1256,7 @@ def main():
         "model_dir": args.model_dir,
         "shuffle_embeddings": bool(args.shuffle_embeddings),
         "zero_latents": bool(args.zero_latents),
+        "strip_think": bool(args.strip_think),
         "seed": args.seed,
         "limit": args.limit,
         "max_new_tokens": args.max_new_tokens,
