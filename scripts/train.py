@@ -78,6 +78,19 @@ def parse_args():
                          "sqrt(embed_dim). 1.0 puts the latents exactly on the "
                          "student's embedding scale; >1 makes the prefix louder. This "
                          "is the swept variable -- see scripts/gate_scale.sh")
+    # Architecture ablations. Both LayerNorms are ON by default and are the two
+    # departures from the reference resampler; these turn them off one at a time so a
+    # change in the gate can be attributed to one of them. See src/model/resampler.py.
+    ap.add_argument("--no-input-norm", action="store_true",
+                    help="drop the LayerNorm in front of bio_projection "
+                         "(input_layer_norm=False), leaving the cached ECG embeddings "
+                         "at their raw ~350 scale, as run 1 trained")
+    ap.add_argument("--no-output-norm", action="store_true",
+                    help="drop the LayerNorm on the resampler output "
+                         "(final_output_norm=False), so the latent scale is whatever "
+                         "the block stack produces -- the reference behaviour. There "
+                         "is then nothing for --prefix-scale to calibrate, so the two "
+                         "flags are mutually exclusive unless the scale is 1.0")
     ap.add_argument("--strip-think", action="store_true",
                     help="strip the template's trailing open <think> block from the "
                          "prompt. OFF by default, matching run 1; evaluation must be "
@@ -102,7 +115,14 @@ def parse_args():
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--teacher", default=None)
-    return ap.parse_args()
+    args = ap.parse_args()
+    # With no output LayerNorm there is no calibration target and no gain to set, so a
+    # non-unit scale would be silently ignored -- and the run would carry a label
+    # (log name, checkpoint dir, checkpoint meta) claiming a scale it never applied.
+    if args.no_output_norm and args.prefix_scale != 1.0:
+        ap.error("--prefix-scale has nothing to calibrate with --no-output-norm; "
+                 f"drop one of the two (got --prefix-scale {args.prefix_scale:g})")
+    return args
 
 
 def set_seed(seed):
@@ -382,6 +402,8 @@ def main():
         args.lr = 1e-4 if args.overfit is not None else 1e-5
     _RUN_META.update({
         "prefix_scale": args.prefix_scale,
+        "input_layer_norm": not args.no_input_norm,
+        "final_output_norm": not args.no_output_norm,
         "strip_think": bool(args.strip_think),
         "lr": args.lr,
         "batch_size": args.batch_size,
@@ -417,7 +439,12 @@ def main():
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     dev = next(model.get_input_embeddings().parameters()).device
 
-    resampler = Resampler(PerceiverResamplerConfig.ecg()).to(dev)
+    resampler = Resampler(PerceiverResamplerConfig.ecg(
+        input_layer_norm=not args.no_input_norm,
+        final_output_norm=not args.no_output_norm,
+    )).to(dev)
+    print(f"resampler architecture: input_layer_norm={not args.no_input_norm} "
+          f"final_output_norm={not args.no_output_norm}")
     # Start the latents at the student's own embedding scale. The splice puts them
     # in front of real token embeddings, and attention logits are dot products, so
     # a prefix far shorter than those embeddings draws almost no attention weight
@@ -425,11 +452,17 @@ def main():
     # the LayerNorm gain trains like any other parameter, and on resume the
     # checkpoint's learned value replaces it (resume() loads after this).
     embed_norm = mean_embedding_norm(model.get_input_embeddings().weight)
-    target = args.prefix_scale * embed_norm
-    gain = resampler.calibrate_output_norm(target)
-    print(f"student mean embedding norm: {embed_norm:.4f}; prefix_scale "
-          f"{args.prefix_scale:g} -> target latent norm {target:.4f}; output LayerNorm "
-          f"gain set to {gain:.6f} (= {target:.4f} / sqrt({resampler.config.embed_dim}))")
+    if args.no_output_norm:
+        print(f"student mean embedding norm: {embed_norm:.4f}; output LayerNorm is OFF "
+              "(--no-output-norm), so there is no gain to calibrate: the latent scale "
+              "is whatever the block stack produces")
+    else:
+        target = args.prefix_scale * embed_norm
+        gain = resampler.calibrate_output_norm(target)
+        print(f"student mean embedding norm: {embed_norm:.4f}; prefix_scale "
+              f"{args.prefix_scale:g} -> target latent norm {target:.4f}; output "
+              f"LayerNorm gain set to {gain:.6f} "
+              f"(= {target:.4f} / sqrt({resampler.config.embed_dim}))")
     resampler.train()
     n_train = sum(p.numel() for p in resampler.parameters() if p.requires_grad)
     n_frozen_grad = sum(1 for p in model.parameters() if p.requires_grad)
