@@ -13,14 +13,20 @@
 # the gate still passes. Submit it once per point:
 #
 #   mkdir -p logs
-#   sbatch scripts/gate_scale.sh 1     -> logs/gate_scale1_400steps.log
+#   sbatch scripts/gate_scale.sh 1     -> logs/gate_scale1_400steps_lr1e-4.log
 #   sbatch scripts/gate_scale.sh 5
 #   sbatch scripts/gate_scale.sh 20
 #
 # --steps N raises the step cap from the 400 a gate check needs to however long it
 # takes to actually reach the target loss:
 #
-#   sbatch scripts/gate_scale.sh 5 --steps 3000   -> logs/gate_scale5_3000steps.log
+#   sbatch scripts/gate_scale.sh 5 --steps 3000
+#                                     -> logs/gate_scale5_3000steps_lr1e-4.log
+#
+# --lr VALUE overrides the 1e-4 train.py uses in overfit mode:
+#
+#   sbatch scripts/gate_scale.sh 5 --lr 3e-5
+#                                     -> logs/gate_scale5_400steps_lr3e-5.log
 #
 # ARCHITECTURE ABLATIONS, one change at a time. Both LayerNorms are on by default
 # (they are the two departures from the reference resampler); either can be
@@ -28,21 +34,22 @@
 # ablation never lands on a baseline's files:
 #
 #   sbatch scripts/gate_scale.sh 1 --no-input-norm
-#                                     -> logs/gate_scale1_400steps_noinput.log
+#                              -> logs/gate_scale1_400steps_lr1e-4_noinput.log
 #   sbatch scripts/gate_scale.sh 1 --no-output-norm
-#                                     -> logs/gate_scale1_400steps_nooutput.log
+#                              -> logs/gate_scale1_400steps_lr1e-4_nooutput.log
 #   sbatch scripts/gate_scale.sh 1 --no-input-norm --no-output-norm
-#                                     -> logs/gate_scale1_400steps_noinput_nooutput.log
+#                              -> logs/gate_scale1_400steps_lr1e-4_noinput_nooutput.log
 #
 # --no-output-norm removes the thing --prefix-scale calibrates, so it is only
 # accepted at scale 1 (train.py refuses the combination too); with both norms off
 # the resampler is the reference architecture exactly.
 #
 # Every run's log and checkpoint directory are named for what produced them --
-# logs/gate_scale<scale>_<steps>steps<flags>.log -- so several can be in the queue
-# at once without touching each other.
+# logs/gate_scale<scale>_<steps>steps_lr<lr><flags>.log -- so several can be in the
+# queue at once without touching each other.
 #
-# WHAT VARIES: --prefix-scale, the step cap and the two norm flags, nothing else.
+# WHAT VARIES: --prefix-scale, the step cap, the LR and the two norm flags,
+# nothing else.
 # The prompt keeps the template's <think> block (DatasetConfig.strip_think is off by
 # default, as run 1 trained), so a difference between runs can only come from how
 # loud the prefix is and which norms are present.
@@ -72,18 +79,26 @@
 set -euo pipefail
 
 DEFAULT_STEPS=400
+# Mirrors train.py's own overfit default (it picks 1e-4 when --overfit is set, 1e-5
+# otherwise). Passing it explicitly is what lets the tag name the LR that ran; if
+# train.py's overfit default ever changes, change this with it.
+DEFAULT_LR=1e-4
 
 usage() {
-    echo "usage: sbatch scripts/gate_scale.sh <prefix-scale> [--steps N]" \
+    echo "usage: sbatch scripts/gate_scale.sh <prefix-scale> [--steps N] [--lr VALUE]" \
          "[--no-input-norm] [--no-output-norm]"
     echo "   e.g. sbatch scripts/gate_scale.sh 5"
     echo "        sbatch scripts/gate_scale.sh 5 --steps 3000"
+    echo "        sbatch scripts/gate_scale.sh 5 --lr 3e-5"
     echo "        sbatch scripts/gate_scale.sh 1 --no-input-norm"
     echo "   --steps is the --overfit-max-steps cap (default $DEFAULT_STEPS)"
+    echo "   --lr is the AdamW learning rate (default $DEFAULT_LR, as train.py uses"
+    echo "        in --overfit mode); accepts 1e-4 or 0.0001"
 }
 
 SCALE=""
 STEPS="$DEFAULT_STEPS"
+LR="$DEFAULT_LR"
 NO_INPUT=0
 NO_OUTPUT=0
 while [[ $# -gt 0 ]]; do
@@ -98,6 +113,16 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --steps=*)        STEPS="${1#*=}" ;;
+        --lr)
+            if [[ $# -lt 2 ]]; then
+                echo "--lr needs a value" >&2
+                usage >&2
+                exit 2
+            fi
+            LR="$2"
+            shift
+            ;;
+        --lr=*)           LR="${1#*=}" ;;
         --no-input-norm)  NO_INPUT=1 ;;
         --no-output-norm) NO_OUTPUT=1 ;;
         -h|--help)        usage; exit 0 ;;
@@ -135,8 +160,22 @@ TAG="$(printf '%g' "$SCALE")"
 # The step cap is always in the tag, including at the default. Leaving it out when
 # it happens to equal DEFAULT_STEPS would make a 400-step log indistinguishable
 # from one run after the default changed -- and the whole point of the tag is that
-# a filename says what produced it.
+# a filename says what produced it. Same for the LR below.
 TAG+="_${STEPS}steps"
+
+if ! [[ "$LR" =~ ^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]] \
+   || ! awk -v x="$LR" 'BEGIN { exit !(x + 0 > 0) }'; then
+    echo "--lr must be a positive number, e.g. 1e-4 or 0.0001, got '$LR'" >&2
+    exit 2
+fi
+# Canonical compact scientific form, so the same rate always produces the same tag
+# whichever way it was typed: 1e-4, 0.0001 and 1.0e-04 all become lr1e-4.
+LR_TAG="$(awk -v x="$LR" 'BEGIN {
+    split(sprintf("%e", x), p, "e"); m = p[1]
+    sub(/0+$/, "", m); sub(/\.$/, "", m)
+    printf "%se%d", m, p[2] + 0
+}')"
+TAG+="_lr${LR_TAG}"
 
 # Build the flag pass-through and the matching filename suffix together, so a run's
 # name can never disagree with the architecture it actually ran.
@@ -179,7 +218,7 @@ if [[ -n "$missing" ]]; then
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-# One directory per (scale, steps, flags) point, so queued jobs cannot collide.
+# One directory per (scale, steps, lr, flags) point, so queued jobs cannot collide.
 CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/gate_scale$TAG}"
 TARGET_LOSS="${TARGET_LOSS:-0.05}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -190,13 +229,13 @@ mkdir -p "$CKPT_DIR" logs
 
 cd "$SLURM_SUBMIT_DIR"
 LOG="logs/gate_scale${TAG}.log"
-echo "host: $(hostname)   prefix_scale: $SCALE   steps: $STEPS   flags: ${EXTRA[*]:-none}"
+echo "host: $(hostname)   prefix_scale: $SCALE   steps: $STEPS   lr: $LR   flags: ${EXTRA[*]:-none}"
 echo "ckpt: $CKPT_DIR   log: $LOG"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
-# tee so the run has a log named by its scale, step cap and flags; slurm's own
-# --output file
-# keeps whatever happens before this point (module load, venv, preflight failures).
+# tee so the run has a log named by its scale, step cap, LR and flags; slurm's own
+# --output file keeps whatever happens before this point (module load, venv,
+# preflight failures).
 # ${EXTRA[@]+...} because `set -u` treats an unset empty array as unbound on bash 4.
 srun python scripts/train.py \
     --model-dir "$MODEL_DIR" \
@@ -207,5 +246,6 @@ srun python scripts/train.py \
     --batch-size "$BATCH_SIZE" \
     --overfit-target-loss "$TARGET_LOSS" \
     --overfit-max-steps "$STEPS" \
+    --lr "$LR" \
     --prefix-log-every 50 \
     2>&1 | tee "$LOG"
