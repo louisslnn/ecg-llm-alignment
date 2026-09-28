@@ -711,7 +711,11 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
 @torch.no_grad()
 def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
                          report_label=None):
-    """Per-example next-token loss on the real target. Returns [(loss, n_tokens)].
+    """Per-example next-token loss on the real target.
+
+    Returns ``[(loss, n_tokens, position_losses)]``, where ``position_losses`` is the
+    loss at each target position in order -- index 0 is the target's first token.
+    ``loss`` is their mean, so the two are always consistent.
 
     The batch comes from training's own collate (``src.data.dataset.make_collate_fn``),
     so the prompt is built exactly as generation builds it, the real target and EOS
@@ -744,13 +748,16 @@ def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
         keep = targets[i] != -100
         n = int(keep.sum())
         if n == 0:                       # a target truncated away entirely by --max-length
-            per_example.append((None, 0))
+            per_example.append((None, 0, []))
             continue
         # Upcast only the target positions: the full (B, L, 152k) tensor in fp32
         # would be gigabytes for a number that depends on a few hundred rows.
-        loss = F.cross_entropy(logits[i][keep].float(), targets[i][keep],
-                               reduction="mean")
-        per_example.append((float(loss), n))
+        per_pos = F.cross_entropy(logits[i][keep].float(), targets[i][keep],
+                                  reduction="none")
+        # 4 dp keeps the jsonl a few hundred KB at 200 examples instead of megabytes;
+        # a bucket mean over thousands of positions is unaffected at that precision.
+        per_example.append((float(per_pos.mean()), n,
+                            [round(float(x), 4) for x in per_pos]))
     return per_example
 
 
@@ -862,6 +869,42 @@ def summarise_run(records: List[dict], n_impure: int, elapsed: float) -> None:
 
 
 
+# Where in the target the loss falls. The opening tokens are the block's fixed
+# scaffolding ("Evidence:" and the first words after it), which the student can
+# predict from the prompt alone; if the ECG is doing anything, it has to show up
+# later, so a flat profile across these buckets is itself a finding.
+POSITION_BUCKETS = ((0, 10, "0-9"), (10, 25, "10-24"), (25, 50, "25-49"),
+                    (50, 100, "50-99"), (100, None, "100+"))
+
+
+def summarise_positions(records: List[dict]) -> List[Dict[str, Any]]:
+    """Pooled mean loss per target-position bucket.
+
+    Pooled over (example, position) pairs rather than averaging per-example means:
+    a bucket a long target barely reaches should not count as much as one every
+    target fills. ``n_examples`` says how many targets reach each bucket at all.
+    """
+    sums = [0.0] * len(POSITION_BUCKETS)
+    counts = [0] * len(POSITION_BUCKETS)
+    examples = [0] * len(POSITION_BUCKETS)
+    for r in records:
+        pos = r.get("position_losses")
+        if not pos:                      # older jsonl, or a target truncated away
+            continue
+        arr = np.asarray(pos, dtype=np.float64)
+        for k, (lo, hi, _) in enumerate(POSITION_BUCKETS):
+            seg = arr[lo:hi] if hi is not None else arr[lo:]
+            if seg.size:
+                sums[k] += float(seg.sum())
+                counts[k] += int(seg.size)
+                examples[k] += 1
+    return [
+        {"positions": label, "n_positions": counts[k], "n_examples": examples[k],
+         "mean_loss": (sums[k] / counts[k]) if counts[k] else None}
+        for k, (_, _, label) in enumerate(POSITION_BUCKETS)
+    ]
+
+
 def summarise_teacher_forced(records: List[dict]) -> Dict[str, Any]:
     """Mean loss over examples, plus the token-weighted mean and a per-superclass cut."""
     scored = [r for r in records if r["loss"] is not None]
@@ -877,6 +920,7 @@ def summarise_teacher_forced(records: List[dict]) -> Dict[str, Any]:
                                      if len(scored) and ntok.sum() > 0 else None),
         "median_loss": float(np.median(losses)) if len(scored) else None,
         "mean_target_tokens": float(ntok.mean()) if len(scored) else None,
+        "per_position": summarise_positions(scored),
         "per_superclass": {},
     }
     for sc in SUPERCLASSES:
@@ -898,6 +942,16 @@ def print_teacher_forced(summary: Dict[str, Any]) -> None:
     print(f"  median                   {_fmt(summary['median_loss'], width=7, prec=4)}")
     mtt = summary["mean_target_tokens"]
     print(f"  mean target tokens       {mtt:.0f}" if mtt else "  mean target tokens       n/a")
+
+    rows = summary.get("per_position") or []
+    if any(r["n_positions"] for r in rows):
+        print("\n  loss by position within the target (pooled over examples)")
+        print(f"    {'positions':<10} {'mean loss':>9} {'tokens':>9} {'examples':>9}")
+        for r in rows:
+            print(f"    {r['positions']:<10} {_fmt(r['mean_loss'], width=9, prec=4)} "
+                  f"{r['n_positions']:>9,} {r['n_examples']:>9,}")
+        print("    (the first tokens are the block's fixed scaffolding, which the "
+              "prompt\n     alone predicts; the ECG can only show up further in)")
     print("  per superclass:")
     for sc, m in summary["per_superclass"].items():
         print(f"    {sc:<5} n {m['n']:>6}  loss {_fmt(m['mean_loss'], width=7, prec=4)}")
@@ -1105,7 +1159,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                                            # the prefix-scale check, once per pass
                                            report_label=("prompt+target" if bi == 0
                                                          else None))
-        for b, (loss, n_tok) in enumerate(per_example):
+        for b, (loss, n_tok, pos_losses) in enumerate(per_example):
             records.append({
                 "ecg_id": batch["ecg_id"][b],
                 "superclass": batch["superclass"][b],
@@ -1114,6 +1168,8 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                 "label": bool(batch["head_label"][b]),
                 "loss": loss,
                 "n_target_tokens": n_tok,
+                # loss at each target position in order; mean == "loss" above
+                "position_losses": pos_losses,
                 "shuffled_embeddings": bool(shuffled),
                 "zero_latents": bool(zero_latents),
                 "seed": seed,
