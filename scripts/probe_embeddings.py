@@ -163,19 +163,27 @@ def apply_variant(train_X: np.ndarray, test_X: np.ndarray, variant: str):
 # --------------------------------------------------------------------------- #
 
 
-def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float, max_iter: int, seed: int):
+def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float, max_iter: int, seed: int,
+               device=None):
     """One binary logistic regression by full-batch LBFGS.
 
     Returns ``(w, b, info)``. ``info`` carries the final loss and gradient norm so
     an underfit probe is visible rather than silently reported as a weak embedding:
     this script's whole purpose is measuring how much signal is there, and a probe
     that failed to converge understates exactly that.
+
+    ``device`` is None (CPU) for this script, which is CPU-only by design. It exists
+    for scripts/probe_latents.py, whose features are 5120-wide rather than 768: the
+    strong-Wolfe line search runs thousands of closure evaluations, and at that width
+    a fit that takes minutes here takes hours. The arithmetic is identical -- fp64
+    throughout, same seed, same optimiser -- only the device moves.
     """
     torch.manual_seed(seed)
-    Xt = torch.as_tensor(X, dtype=torch.float64)
-    yt = torch.as_tensor(y.astype(np.float64), dtype=torch.float64)
-    w = torch.zeros(Xt.shape[1], dtype=torch.float64, requires_grad=True)
-    b = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    Xt = torch.as_tensor(X, dtype=torch.float64).to(dev)
+    yt = torch.as_tensor(y.astype(np.float64), dtype=torch.float64).to(dev)
+    w = torch.zeros(Xt.shape[1], dtype=torch.float64, device=dev, requires_grad=True)
+    b = torch.zeros(1, dtype=torch.float64, device=dev, requires_grad=True)
 
     opt = torch.optim.LBFGS([w, b], max_iter=max_iter, history_size=20,
                             tolerance_grad=1e-9, tolerance_change=1e-12,
@@ -197,7 +205,7 @@ def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float, max_iter: int, seed: int
         grad_norm = float(torch.cat([w.grad.flatten(), b.grad.flatten()]).norm())
         final = float(torch.nn.functional.binary_cross_entropy_with_logits(
             Xt @ w + b, yt) + l2 * w.pow(2).sum())
-    return (w.detach().numpy(), float(b.detach()),
+    return (w.detach().cpu().numpy(), float(b.detach()),
             {"loss": final, "initial_loss": initial, "grad_norm": grad_norm})
 
 
