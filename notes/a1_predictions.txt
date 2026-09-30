@@ -6,3 +6,15 @@ fixed vs pooled:       little difference, since task conditioning was weak.
 shuffle-labels null:   PASS, margin under 0.02.
 If pooled lands near 0.713, the resampler preserves the ECG information and
 the LLM interface is the fault. If near the floor, the resampler destroys it.
+
+Added 2026-09-30 18:30, still before results.
+Control run for 4332710 is job 4194434 (fixed NORM, prompt-and-target):
+  latents macro 0.843 / 0.950, embeddings macro 0.714 / 0.882, dAUPRC +0.130
+  NORM AUPRC 1.000 with grad 4.12e-07, a separating fit.
+The +0.130 is contaminated for every class, not only NORM: the Evidence
+section carries report-derived observations that bear on MI and STTC too.
+Prediction for 4332710 (fixed, prompt-only):
+  macro falls from 0.843 toward 0.714 or below.
+  Near 0.714 means the resampler preserves the signal and the LLM interface
+  is the fault. Below means it destroys signal. Still near 0.843 means the
+  leak does not explain the probe and I am wrong.
