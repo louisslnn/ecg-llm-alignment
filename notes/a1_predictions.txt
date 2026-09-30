@@ -1,0 +1,8 @@
+Prediction, recorded before results, 2026-09-30.
+Jobs: 4332709 pooled  4332710 fixed  4332711 pooled + shuffle-labels
+Raw-embedding baseline: macro AUPRC 0.713, AUROC 0.882.
+pooled + prompt-only:  macro AUPRC near the positive rate, well below 0.713.
+fixed vs pooled:       little difference, since task conditioning was weak.
+shuffle-labels null:   PASS, margin under 0.02.
+If pooled lands near 0.713, the resampler preserves the ECG information and
+the LLM interface is the fault. If near the floor, the resampler destroys it.
