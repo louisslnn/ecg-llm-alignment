@@ -18,3 +18,12 @@ Prediction for 4332710 (fixed, prompt-only):
   Near 0.714 means the resampler preserves the signal and the LLM interface
   is the fault. Below means it destroys signal. Still near 0.843 means the
   leak does not explain the probe and I am wrong.
+
+A6 prediction, recorded 2026-09-30 before submission.
+Contaminated: mean real 0.2966 / shuf 0.3381 (+14%), 0-9 real 0.064 / shuf 0.234 (+266%).
+Under prompt-only:
+  0-9 real rises sharply from 0.064, the copy channel is gone, and the
+  0-9 gap collapses from +266% toward single digits. This is the bucket
+  that decides it, not the mean.
+  mean real rises from 0.2966 toward the zeroed value; mean gap under 2%.
+  If 0-9 real stays near 0.064, the target was not the channel and I am wrong.
