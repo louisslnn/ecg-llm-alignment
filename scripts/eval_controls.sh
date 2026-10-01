@@ -8,8 +8,15 @@
 #SBATCH --job-name=ecg-controls
 #SBATCH --output=logs/eval_controls_%j.log
 #
-# The control sweep in ONE job: three generation conditions (real, shuffled ECGs,
-# zeroed prefix) plus the teacher-forced loss, on a single load of the 14B.
+# The control sweep in ONE job: three conditions (real, shuffled ECGs, zeroed
+# prefix), each both generated and teacher-forced, on a single load of the 14B.
+#
+# The teacher-forced table carries the mean and the per-position buckets for all
+# three conditions with a per-bucket real-vs-shuffled gap, and below it the same
+# rows from run 1's contaminated measurement, so the two are compared row by row.
+# --task-stream controls what the resampler's task-text stream reads in that pass
+# (default prompt; prompt-and-target reproduces run 1):
+#   sbatch scripts/eval_controls.sh --task-stream prompt-and-target
 #
 # Same venv, model dir and module stack as scripts/train.sh and scripts/evaluate.sh.
 # Pass extra flags straight through:
@@ -18,9 +25,10 @@
 #   CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/ckpt_step5000.pt sbatch scripts/eval_controls.sh
 #
 # The hour: 3 x 50 generations at batch 1 is ~150 decodes of a few hundred greedy
-# tokens each, which is the bulk of the time; the 200-example teacher-forced pass is
-# a few minutes, and the model load a few more. That fits an hour with room to
-# spare, but raising --limit raises it close to linearly -- 3 x 200 will not fit.
+# tokens each, which is the bulk of the time; the teacher-forced sweep is now 3 x 200
+# forward passes rather than one pass of 200, which is still only a few minutes, and
+# the model load a few more. That fits an hour with room to spare, but raising
+# --limit raises it close to linearly -- 3 x 200 generations will not fit.
 # Batch 1 is deliberate: it keeps each condition's decode independent of how a batch
 # happened to be padded, which is what makes the byte-identical comparison trustworthy.
 #

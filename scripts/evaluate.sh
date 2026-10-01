@@ -79,10 +79,19 @@ BATCH_SIZE="${BATCH_SIZE:-8}"
 # control's would destroy the only thing worth comparing it against. Mirrors
 # evaluate.py's own default naming (condition_suffix).
 SUFFIX=""
+prev=""
 for arg in "$@"; do
     [[ "$arg" == "--shuffle-embeddings" ]] && SUFFIX="${SUFFIX}_shuffled"
     [[ "$arg" == "--zero-latents" ]] && SUFFIX="${SUFFIX}_zeroed"
     [[ "$arg" == "--teacher-forced-loss" ]] && SUFFIX="${SUFFIX}_teacher_forced"
+    # The resampler's task stream is part of the experiment's identity. Only the
+    # non-default is tagged, so a prompt-only run keeps the plain name -- WHICH MEANS
+    # it lands on a file an older, prompt-and-target run may already hold. Move those
+    # aside or pass OUT= if you still need them.
+    [[ "$prev" == "--task-stream" && "$arg" == "prompt-and-target" ]] \
+        && SUFFIX="${SUFFIX}_withtarget"
+    [[ "$arg" == "--task-stream=prompt-and-target" ]] && SUFFIX="${SUFFIX}_withtarget"
+    prev="$arg"
 done
 OUT="${OUT:-$EVAL_DIR/eval_${SPLIT}${SUFFIX}.jsonl}"
 

@@ -41,9 +41,12 @@
 # Start with `--question-mode fixed --limit-records 500` to confirm the pipeline and
 # the checkpoint before spending a long job on the full pooled run.
 #
-# Each question mode writes its own JSON (and in fixed mode, each question), so a
-# second run cannot overwrite the first -- comparing them is the reason to run more
-# than one.
+# Each question mode writes its own JSON (and in fixed mode, each question), as do
+# --task-text prompt-and-target and the --shuffle-embeddings / --shuffle-labels
+# controls, so a null run can never overwrite the number it is the null for:
+#   probe_latents_pooled.json                  the run
+#   probe_latents_pooled_shuflab.json          its label-shuffle control
+#   probe_latents_pooled_withtarget.json       training's own task-text stream
 #
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 # Submit from the repo root after `mkdir -p logs`.
@@ -90,13 +93,19 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 # own (pooled, and NORM for the fixed question).
 MODE="pooled"
 QUESTION="NORM"
+TASK_TEXT="prompt"
+CONTROLS=""
 prev=""
 for arg in "$@"; do
     [[ "$prev" == "--question-mode" ]] && MODE="$arg"
     [[ "$prev" == "--fixed-question" ]] && QUESTION="$arg"
+    [[ "$prev" == "--task-text" ]] && TASK_TEXT="$arg"
     case "$arg" in
-        --question-mode=*)  MODE="${arg#*=}" ;;
-        --fixed-question=*) QUESTION="${arg#*=}" ;;
+        --question-mode=*)     MODE="${arg#*=}" ;;
+        --fixed-question=*)    QUESTION="${arg#*=}" ;;
+        --task-text=*)         TASK_TEXT="${arg#*=}" ;;
+        --shuffle-embeddings)  CONTROLS="${CONTROLS}_shufemb" ;;
+        --shuffle-labels)      CONTROLS="${CONTROLS}_shuflab" ;;
     esac
     prev="$arg"
 done
@@ -106,6 +115,10 @@ if [[ "$MODE" == "fixed" ]]; then
     TAG="fixed_$QUESTION"
     SHOWN="fixed ($QUESTION)"
 fi
+# The task-text stream and the controls are part of the experiment's identity too: a
+# null run must never land on the file holding the number it is the null for.
+[[ "$TASK_TEXT" == "prompt" ]] || TAG="${TAG}_withtarget"
+TAG="${TAG}${CONTROLS}"
 OUT="${OUT:-$EVAL_DIR/probe_latents_${TAG}.json}"
 
 source "$VENV/bin/activate"
@@ -114,7 +127,7 @@ mkdir -p "$EVAL_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
 echo "host: $(hostname)   run: $RUN   ckpt: $CKPT"
-echo "mode: $SHOWN   out: $OUT"
+echo "mode: $SHOWN   task-text: $TASK_TEXT   out: $OUT"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 # "$@" is appended last, so anything passed to sbatch overrides these defaults

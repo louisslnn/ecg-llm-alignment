@@ -343,6 +343,7 @@ class PerceiverResamplerBlock(nn.Module):
         attention_mask_1: Optional[torch.Tensor] = None,
         attention_mask_2: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Masks are (B, 1, resampled_length, S+resampled_length) boolean, True = keep."""
         res = x
         x = self.norm_cross_attention_1(x)
         attn_output = self.cross_attention_1(
@@ -403,6 +404,7 @@ class PerceiverResampler(nn.Module):
         attention_mask_1: Optional[torch.Tensor] = None,
         attention_mask_2: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Masks are boolean, True = keep, already spanning stream+latent keys."""
         for layer in self.layers:
             concat_input_1 = torch.cat([xf_1, x], dim=1)
             concat_input_2 = torch.cat([xf_2, x], dim=1)
@@ -422,6 +424,7 @@ class PerceiverResampler(nn.Module):
         attention_mask_1: Optional[torch.Tensor] = None,
         attention_mask_2: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Masks are boolean, True = keep, and must cover S+resampled_length keys."""
         assert input_embeddings_1.shape[-1] == self.config.embed_dim, (
             "stream 1 embedding dim should match embed_dim"
         )
@@ -531,6 +534,16 @@ class Resampler(nn.Module):
         ecg_mask: Optional[torch.Tensor] = None,
         task_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """MASK CONVENTION: (B, S) boolean, True = attend to this position, False =
+        padding the latents must never read; None means every position is real.
+
+        This is SDPA's boolean-``attn_mask`` polarity, NOT
+        ``nn.MultiheadAttention``'s ``key_padding_mask`` (where True means ignore),
+        and not an additive float bias. Verified numerically, both directions, in
+        tests/test_resampler.py::test_task_mask_false_positions_cannot_reach_the_output.
+        The latent block of the concatenated key axis is appended by
+        :func:`build_perceiver_padding_attention_mask` and is always True.
+        """
         if self.input_norm is not None:
             ecg_embeddings = self.input_norm(ecg_embeddings)
         projected_ecg = self.bio_projection(ecg_embeddings)

@@ -23,6 +23,7 @@ sys.path.insert(0, REPO_ROOT)
 from src.model.resampler import (
     PerceiverResamplerConfig,
     Resampler,
+    build_perceiver_padding_attention_mask,
     mean_embedding_norm,
 )
 
@@ -299,6 +300,156 @@ def test_different_task_prompts_change_latents():
         out_b = model(ecg, emb(ids_b))
 
     assert not torch.allclose(out_a, out_b, atol=1e-5), "task prompt had no effect"
+
+
+# --------------------------------------------------------------------------- #
+# Mask semantics                                                              #
+# --------------------------------------------------------------------------- #
+# These prove the convention numerically rather than reading it off the source.
+# The claim under test: a False entry in ecg_mask / task_mask means "this position
+# is padding, never attend to it". If that is what the code does, then whatever is
+# written into those positions cannot reach the output, so overwriting them has to
+# leave the latents BIT-identical -- not close, identical. A flipped convention, a
+# mask that never reaches the attention, or an off-by-N in the key axis all show up
+# as a changed output.
+#
+# The junk is large but FINITE on purpose. Masked logits are set to -1e30 and
+# softmaxed to exactly 0.0, and 0.0 * finite == 0.0; 0.0 * inf would be nan and the
+# test would fail for arithmetic reasons rather than masking ones.
+MASK_JUNK = 1e3
+
+
+def _junk_like(x: torch.Tensor) -> torch.Tensor:
+    return torch.randn_like(x) * MASK_JUNK
+
+
+def test_task_mask_false_positions_cannot_reach_the_output():
+    """True = attend, False = padding: rewriting padding changes nothing, exactly."""
+    cfg = PerceiverResamplerConfig.debug()
+    model = Resampler(cfg).eval()
+    emb = _frozen_student_embedding(cfg.embed_dim)
+    ecg, task_embeds, task_mask = _batch(cfg, emb)
+    assert not task_mask.all(), "this test needs at least one masked position"
+
+    corrupted = task_embeds.clone()
+    corrupted[~task_mask] = _junk_like(corrupted[~task_mask])
+
+    with torch.no_grad():
+        clean_out = model(ecg, task_embeds, task_mask=task_mask)
+        junk_out = model(ecg, corrupted, task_mask=task_mask)
+
+    assert torch.equal(clean_out, junk_out), (
+        "task_mask=False positions changed the output, so False does NOT mean "
+        "'ignore' here: the convention is inverted, or the mask never reaches the "
+        f"attention. max|delta| = {(clean_out - junk_out).abs().max():.3e}")
+
+
+def test_ecg_mask_false_positions_cannot_reach_the_output():
+    """The same contract on the bio stream, downstream of input_norm + projection."""
+    cfg = PerceiverResamplerConfig.debug()
+    model = Resampler(cfg).eval()
+    emb = _frozen_student_embedding(cfg.embed_dim)
+    ecg, task_embeds, _ = _batch(cfg, emb)
+
+    ecg_mask = torch.ones(B, N_ECG, dtype=torch.bool)
+    ecg_mask[:, N_ECG // 2:] = False            # the back half is "padding"
+
+    corrupted = ecg.clone()
+    corrupted[~ecg_mask] = _junk_like(corrupted[~ecg_mask])
+
+    with torch.no_grad():
+        clean_out = model(ecg, task_embeds, ecg_mask=ecg_mask)
+        junk_out = model(corrupted, task_embeds, ecg_mask=ecg_mask)
+
+    assert torch.equal(clean_out, junk_out), (
+        "ecg_mask=False positions changed the output; same diagnosis as the task "
+        f"stream. max|delta| = {(clean_out - junk_out).abs().max():.3e}")
+
+
+def test_masked_out_positions_would_otherwise_matter():
+    """The control for the two tests above: an all-True mask hides nothing.
+
+    Without this, a mask that excluded EVERYTHING (or an attention that ignored the
+    stream entirely) would pass them both -- rewriting excluded positions would
+    change nothing because nothing was ever read.
+    """
+    cfg = PerceiverResamplerConfig.debug()
+    model = Resampler(cfg).eval()
+    emb = _frozen_student_embedding(cfg.embed_dim)
+    ecg, task_embeds, task_mask = _batch(cfg, emb)
+
+    all_real = torch.ones_like(task_mask)
+    corrupted = task_embeds.clone()
+    corrupted[~task_mask] = _junk_like(corrupted[~task_mask])   # same positions
+
+    with torch.no_grad():
+        clean_out = model(ecg, task_embeds, task_mask=all_real)
+        junk_out = model(ecg, corrupted, task_mask=all_real)
+
+    assert not torch.equal(clean_out, junk_out), (
+        "with an all-True mask the same positions still had no effect: the task "
+        "stream is not being read at all, which would make the masking tests "
+        "vacuous")
+
+
+def test_padding_mask_covers_the_latent_positions():
+    """The key axis is stream_len + resampled_length, and the mask spans all of it.
+
+    The KV of each cross-attention is torch.cat([stream, latents], dim=1), so a mask
+    built over stream_len alone would be short by resampled_length. Assert the built
+    shape and that the appended block is True (latents always attendable).
+    """
+    cfg = PerceiverResamplerConfig.debug()
+    seq_len, rl = 11, cfg.resampled_length
+    valid = torch.ones(B, seq_len, dtype=torch.bool)
+    valid[0, -3:] = False
+
+    mask = build_perceiver_padding_attention_mask(valid, rl)
+
+    assert mask.shape == (B, 1, rl, seq_len + rl), (
+        f"expected the key axis to cover stream+latents ({seq_len + rl}), got "
+        f"{tuple(mask.shape)}")
+    assert mask[..., seq_len:].all(), "the latent block must be attendable"
+    assert torch.equal(mask[0, 0, 0, :seq_len], valid[0]), (
+        "the stream block must reproduce the validity mask position for position")
+
+
+def test_the_latent_key_block_is_load_bearing():
+    """Masking the appended latent columns changes the output, so they are read.
+
+    Proves the trailing resampled_length columns are not vestigial padding that
+    happens to be ignored: flip them to False and the latents stop attending to
+    themselves, which must move the result.
+    """
+    cfg = PerceiverResamplerConfig.debug()
+    model = Resampler(cfg).eval()
+    emb = _frozen_student_embedding(cfg.embed_dim)
+    ecg, task_embeds, _ = _batch(cfg, emb)
+    rl = cfg.resampled_length
+
+    ecg_mask = torch.ones(B, N_ECG, dtype=torch.bool)
+    task_mask = torch.ones(B, T, dtype=torch.bool)
+    full_ecg = build_perceiver_padding_attention_mask(ecg_mask, rl)
+    full_task = build_perceiver_padding_attention_mask(task_mask, rl)
+    no_latents_ecg = full_ecg.clone()
+    no_latents_task = full_task.clone()
+    no_latents_ecg[..., N_ECG:] = False
+    no_latents_task[..., T:] = False
+
+    with torch.no_grad():
+        projected = model.bio_projection(
+            model.input_norm(ecg) if model.input_norm is not None else ecg)
+        with_latents = model.perceiver_resampler(
+            input_embeddings_1=projected, input_embeddings_2=task_embeds,
+            attention_mask_1=full_ecg, attention_mask_2=full_task)["embeddings"]
+        without = model.perceiver_resampler(
+            input_embeddings_1=projected, input_embeddings_2=task_embeds,
+            attention_mask_1=no_latents_ecg,
+            attention_mask_2=no_latents_task)["embeddings"]
+
+    assert not torch.allclose(with_latents, without, atol=1e-6), (
+        "masking the trailing latent columns changed nothing: the mask is not "
+        "actually spanning the concatenated key axis")
 
 
 if __name__ == "__main__":

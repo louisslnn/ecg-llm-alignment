@@ -49,6 +49,7 @@ from src.data.dataset import (  # noqa: E402
     DatasetConfig,
     build_datasets,
     make_collate_fn,
+    prompt_only_task_mask,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 
@@ -140,22 +141,37 @@ def check_gradients(model, resampler):
     return norms
 
 
-def splice_forward(model, resampler, batch, dev):
+def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt"):
     """The validated splice: prepend resampler latents to the token embeddings and
     run the frozen LLM, loss on the target only. Returns ``out.loss``.
 
     Prompt + padding are already -100 in ``batch["labels"]``; the 64 latent
     positions are masked to -100 here too, so loss lands only on the target. Shared
     by the memory probe and the training loop so they compute an identical step.
+
+    ``task_stream`` selects what the RESAMPLER's task-text stream may read, and
+    changes nothing about what the LLM receives or where the loss lands:
+
+        "prompt"            the real prompt tokens only (the default). The stream is
+                            then the same one generation feeds it.
+        "prompt-and-target" prompt + target + EOS, which is what run 1 trained on --
+                            the target names the answer, so the resampler can encode
+                            a label it will not have at inference. Kept for
+                            comparison against that run, not as a default.
+
+    ``input_ids`` is untouched either way: the LLM still sees prompt + target + EOS
+    and ``labels`` still supervises the target positions alone.
     """
     ecg = batch["ecg_embed"].to(dev)
     input_ids = batch["input_ids"].to(dev)
     attn = batch["attention_mask"].to(dev)
     labels = batch["labels"].to(dev)
+    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
+                 else attn.bool())
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)          # (B, L, 5120)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=attn.bool())
+        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask)
         B, Lq, _ = latents.shape
 
         # The latents are the prefix; the spliced tensor must carry their grad

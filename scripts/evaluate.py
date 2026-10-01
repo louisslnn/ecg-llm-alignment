@@ -112,10 +112,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for probe_memo
 
 from src.data.dataset import (  # noqa: E402
     DEFAULT_PREFIX_TEXT,
+    TASK_STREAM_MODES,
     DatasetConfig,
     _format_prompt,
     build_datasets,
     make_collate_fn,
+    prompt_only_task_mask,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 from src.teacher import parse as teacher_parse  # noqa: E402
@@ -165,6 +167,14 @@ def parse_args():
     ap.add_argument("--max-length", type=int, default=2048,
                     help="token cap for prompt+target in --teacher-forced-loss "
                          "(training's MAX_TEXT_LEN)")
+    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default="prompt",
+                    help="what the RESAMPLER's task-text stream may read in "
+                         "--teacher-forced-loss. 'prompt' (default) restricts it to "
+                         "the real prompt tokens; 'prompt-and-target' leaves the "
+                         "target in, reproducing run 1. GENERATION IGNORES THIS: its "
+                         "input_ids are the prompt already, so it is prompt-only "
+                         "whatever this says -- which is the mismatch the flag exists "
+                         "to measure. Neither setting changes the loss positions")
     ap.add_argument("--strip-think", action="store_true",
                     help="strip the template's trailing open <think> block from the "
                          "prompt. MUST match what training used (train.py's own "
@@ -646,7 +656,7 @@ def prefix_scale_report(latents, tok_embeds, attn, label="prompt"):
 
 
 def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False,
-                  report_label=None):
+                  report_label=None, task_mask=None):
     """Token embeddings with the resampler's latents spliced in front.
 
     The splice is the training splice (scripts/probe_memory.py splice_forward):
@@ -660,10 +670,19 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
 
     ``report_label`` prints the prefix-vs-token norm comparison for this batch; the
     callers pass it on the first batch only.
+
+    ``task_mask`` is what the resampler's task-text stream may read (True = attend).
+    None falls back to ``attn``, i.e. every real token in ``input_ids``. Generation
+    passes None because its ``input_ids`` ARE the prompt; the teacher-forced path
+    passes :func:`~src.data.dataset.prompt_only_task_mask`, whose ``input_ids`` also
+    hold the target. The splice itself is unaffected: the LLM still receives every
+    token either way.
     """
+    if task_mask is None:
+        task_mask = attn.bool()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=attn.bool())
+        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask.bool())
     if zero_latents:
         latents = torch.zeros_like(latents)
     # torch.cat needs one dtype; autocast can hand back fp32 from a LayerNorm-final
@@ -710,7 +729,7 @@ def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
 
 @torch.no_grad()
 def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
-                         report_label=None):
+                         report_label=None, task_stream: str = "prompt"):
     """Per-example next-token loss on the real target.
 
     Returns ``[(loss, n_tokens, position_losses)]``, where ``position_losses`` is the
@@ -728,9 +747,15 @@ def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
     """
     labels = batch["labels"].to(dev)
     attn = batch["attention_mask"].to(dev)
+    # Only the RESAMPLER's view narrows. input_ids below is the whole sequence and
+    # full_labels below still supervises every target position, so the teacher
+    # forcing is byte-for-byte what it was.
+    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
+                 else attn.bool())
     full_embeds, full_attn, Lq = splice_prefix(
         model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
         attn, dev, zero_latents=zero_latents, report_label=report_label,
+        task_mask=task_mask,
     )
     B = labels.shape[0]
     full_labels = torch.cat(
@@ -1131,7 +1156,8 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
 def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                        split: str, seed: int, shuffled: bool, zero_latents: bool,
                        batch_size: int, num_workers: int = 4, max_length: int = 2048,
-                       out_path: Optional[str] = None, log_every: int = 20):
+                       out_path: Optional[str] = None, log_every: int = 20,
+                       task_stream: str = "prompt"):
     """Next-token loss on the real targets. No generation.
 
     Uses training's collate, so prompt construction, target, EOS and -100 masking are
@@ -1156,6 +1182,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
     for bi, batch in enumerate(loader):
         per_example = teacher_forced_batch(ctx.model, ctx.resampler, batch, ctx.dev,
                                            zero_latents=zero_latents,
+                                           task_stream=task_stream,
                                            # the prefix-scale check, once per pass
                                            report_label=("prompt+target" if bi == 0
                                                          else None))
@@ -1236,6 +1263,14 @@ def main():
     dataset = load_split(data_cfg, args.split)
     if args.shuffle_embeddings:
         dataset = apply_shuffle(dataset, args.seed)
+    if args.teacher_forced_loss:
+        print(f"resampler task stream: {args.task_stream}"
+              + ("  (prompt tokens only -- what generation feeds it)"
+                 if args.task_stream == "prompt"
+                 else "  (target included -- reproducing run 1's training stream)"))
+    elif args.task_stream != "prompt":
+        print(f"note: --task-stream {args.task_stream} is ignored during generation; "
+              "its input_ids are the prompt already")
     if args.zero_latents:
         print("*** ZERO-LATENTS CONTROL ACTIVE ***")
         print("    the resampler still runs; its output is replaced by zeros of the "
@@ -1255,6 +1290,7 @@ def main():
             shuffled=args.shuffle_embeddings, zero_latents=args.zero_latents,
             batch_size=args.batch_size, num_workers=args.num_workers,
             max_length=args.max_length, out_path=args.out, log_every=args.log_every,
+            task_stream=args.task_stream,
         )
         summary = summarise_teacher_forced(records)
         print_teacher_forced(summary)
@@ -1265,6 +1301,7 @@ def main():
                 "shuffle_embeddings": bool(args.shuffle_embeddings),
                 "zero_latents": bool(args.zero_latents),
                 "strip_think": bool(args.strip_think),
+                "task_stream": args.task_stream,
                 "seed": args.seed, "limit": args.limit, "batch_size": args.batch_size,
                 "max_length": args.max_length, "losses": args.out,
                 "elapsed_seconds": round(elapsed, 1), "teacher_forced": summary,
@@ -1316,6 +1353,8 @@ def main():
         "seed": args.seed,
         "limit": args.limit,
         "max_new_tokens": args.max_new_tokens,
+        # generation's stream is the prompt by construction, whatever the flag says
+        "task_stream": "prompt",
         "batch_size": args.batch_size,
         "generations": args.out,
         "n_records": len(all_records),

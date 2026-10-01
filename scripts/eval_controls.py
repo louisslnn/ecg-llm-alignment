@@ -1,14 +1,31 @@
 #!/usr/bin/env python
-"""The control sweep: three generation conditions and a teacher-forced loss, one job.
+"""The control sweep: three conditions, generated and teacher-forced, in one job.
 
 This is the run that says whether a trained resampler is doing anything at all. It
-loads the 14B and the resampler ONCE and then makes four passes over the same slice
-of the split, so the answer arrives in a single queue slot instead of four:
+loads the 14B and the resampler ONCE and then makes six passes over the same slice
+of the split, so the answer arrives in a single queue slot instead of six:
 
     real                the model as trained
     shuffled            every record gets another record's ECG (--shuffle-embeddings)
     zeroed              the prefix is spliced as zeros (--zero-latents)
-    teacher-forced      no generation: loss on the real targets, on a larger slice
+
+each of those twice -- once generating, once teacher-forced on the real targets
+(over a larger slice, since a forward pass is far cheaper than a decode). Running
+the teacher-forced pass under all three conditions is the part that makes the
+losses comparable: a single real-only number says nothing without the shuffled one
+beside it, and the zeroed one is the floor.
+
+THE TEACHER-FORCED TABLE reports the mean and the per-position buckets (0-9, 10-24,
+25-49, 50-99, 100+) for each condition, the real-vs-shuffled percentage gap, and a
+reference BLOCK of run 1's own numbers, row for row -- measured before the
+resampler's task stream was narrowed to the prompt, when the target sat inside the
+stream the resampler reads. The two blocks print one above the other with the same
+row labels, each with its own per-bucket gap, so the comparison is row by row rather
+than mean against mean. See --task-stream, and TF_CONTAMINATED below.
+
+All three conditions must cover the same examples in the same order, which is
+asserted rather than assumed: the whole table is a difference between columns, and
+a differing sample would make it meaningless while looking perfectly normal.
 
 The three generation passes write their own jsonl (so they can be re-read, diffed or
 re-scored later with `evaluate.py --from-jsonl`), and the run ends with a comparison
@@ -30,7 +47,7 @@ attention weight, and identical generations across conditions are explained by s
 alone -- no amount of training signal in the latents will show up downstream.
 
 Defaults are deliberately small -- 50 examples per generation condition at batch 1,
-200 for the teacher-forced pass -- because this is a diagnostic, not the evaluation.
+200 per teacher-forced condition -- because this is a diagnostic, not the evaluation.
 Batch 1 keeps each condition's decode independent of how the batch happened to be
 padded, so a byte-identical comparison means what it says.
 
@@ -56,6 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from evaluate import (  # noqa: E402
     DEFAULT_MAX_NEW_TOKENS,
+    POSITION_BUCKETS,
     EvalContext,
     apply_shuffle,
     build_data_config,
@@ -67,13 +85,45 @@ from evaluate import (  # noqa: E402
     run_teacher_forced,
     summarise_teacher_forced,
 )
+from src.data.dataset import TASK_STREAM_MODES  # noqa: E402
 
-# The three generation conditions, in the order they are run and reported.
+# The three conditions, in the order they are run and reported. Used for both the
+# generation sweep and the teacher-forced sweep, so the two cannot disagree on what
+# "shuffled" or "zeroed" means.
 CONDITIONS = [
     ("real", dict(shuffled=False, zero_latents=False)),
     ("shuffled", dict(shuffled=True, zero_latents=False)),
     ("zeroed", dict(shuffled=False, zero_latents=True)),
 ]
+
+# The bucket labels the measured block uses, taken from evaluate.py so the two
+# cannot drift; the reference block below is keyed by these same strings.
+POSITION_BUCKET_LABELS = tuple(label for _, _, label in POSITION_BUCKETS)
+
+# Run 1's teacher-forced numbers, measured before the resampler's task stream was
+# narrowed to the prompt -- i.e. with the target, conclusion included, inside the
+# stream the resampler reads. Carried here as a reference BLOCK, row for row against
+# the measured one, so the comparison is per bucket rather than mean against mean.
+#
+# Contaminated is the right word: a resampler that can read "Conclusion: Yes" has no
+# need of the waveform, so the real-vs-shuffled gap these rows show is not evidence
+# about the ECG. Note where that gap lives -- the 0-9 bucket, real 0.064 against
+# shuffled 0.234, is the leak at its most visible: with the answer in the stream the
+# opening tokens were nearly free, and they stop being free the moment the ECG is
+# the wrong one. A prompt-only run has no such mechanism available, so a large 0-9
+# gap there would mean something quite different.
+#
+# Keyed by bucket label. If POSITION_BUCKETS is ever rebucketed these keys no longer
+# describe the same spans, which _reference_rows detects rather than silently
+# printing numbers against the wrong rows.
+TF_CONTAMINATED = {
+    "mean":   {"real": 0.2966, "shuffled": 0.3381, "zeroed": 3.2977},
+    "0-9":    {"real": 0.064,  "shuffled": 0.234,  "zeroed": 5.075},
+    "10-24":  {"real": 0.391,  "shuffled": 0.466,  "zeroed": 3.835},
+    "25-49":  {"real": 0.365,  "shuffled": 0.422,  "zeroed": 3.509},
+    "50-99":  {"real": 0.344,  "shuffled": 0.361,  "zeroed": 2.584},
+    "100+":   {"real": 0.252,  "shuffled": 0.266,  "zeroed": 3.247},
+}
 
 
 def parse_args():
@@ -107,6 +157,14 @@ def parse_args():
     ap.add_argument("--print-first", type=int, default=1,
                     help="print the first N generations of each condition in full")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default="prompt",
+                    help="what the RESAMPLER's task-text stream may read in the "
+                         "teacher-forced sweep. 'prompt' (default) is the real prompt "
+                         "tokens only; 'prompt-and-target' reproduces run 1 and is "
+                         "what produced the contaminated reference numbers. "
+                         "Generation is prompt-only either way -- its input_ids are "
+                         "the prompt -- so this flag moves the teacher-forced columns "
+                         "alone")
     ap.add_argument("--skip-teacher-forced", action="store_true")
     # data path overrides (default to DatasetConfig)
     ap.add_argument("--emb-cache", default=None)
@@ -164,6 +222,159 @@ def identical_counts(by_condition):
                 1 for key in common if keyed[a][key] == keyed[b][key]
             )
     return out
+
+
+def example_sequence(records):
+    """The (ecg_id, superclass) keys in the order the records were produced."""
+    return [(r["ecg_id"], r["superclass"]) for r in records]
+
+
+def assert_same_examples(by_condition, what: str):
+    """Fatal unless every condition covered the same examples in the same order.
+
+    The whole sweep is a difference between conditions, so a differing sample makes
+    every column incomparable -- and the failure would be invisible in the table,
+    which shows only aggregates. Order is checked too, not just membership: the
+    per-position buckets and the per-example records are lined up positionally
+    downstream, so a reordering would silently pair one record's loss with another's.
+    """
+    seqs = {name: example_sequence(recs) for name, recs in by_condition.items()}
+    names = list(seqs)
+    if not names:
+        return []
+    ref_name, ref = names[0], seqs[names[0]]
+    for name in names[1:]:
+        other = seqs[name]
+        if len(other) != len(ref):
+            sys.exit(f"{what}: condition '{name}' covered {len(other)} examples but "
+                     f"'{ref_name}' covered {len(ref)}; the conditions are not "
+                     "comparable. Check --limit/--tf-limit and the split.")
+        for i, (a, b) in enumerate(zip(ref, other)):
+            if a != b:
+                sys.exit(f"{what}: condition '{name}' diverges from '{ref_name}' at "
+                         f"position {i}: {b} vs {a}. Same length, different order -- "
+                         "the per-example comparison would pair unrelated records.")
+    print(f"  {what}: all {len(names)} conditions cover the same {len(ref)} examples "
+          "in the same order")
+    return ref
+
+
+def _pct_gap(real, shuffled):
+    """Shuffled relative to real, in percent. Positive = shuffling made it worse."""
+    if real in (None, 0) or shuffled is None:
+        return None
+    return 100.0 * (shuffled - real) / real
+
+
+def _reference_rows():
+    """The contaminated block's rows, in the measured block's row order.
+
+    Returns ``(rows, warning)``. The reference numbers are hardcoded against a
+    specific bucketing, so a bucket the reference does not know about comes back as
+    None with a warning rather than being quietly omitted or, worse, filled from the
+    wrong span.
+    """
+    rows = [("mean", TF_CONTAMINATED.get("mean", {}))]
+    unknown = []
+    for label in POSITION_BUCKET_LABELS:
+        if label in TF_CONTAMINATED:
+            rows.append((f"positions {label}", TF_CONTAMINATED[label]))
+        else:
+            unknown.append(label)
+            rows.append((f"positions {label}", {}))
+    warning = None
+    if unknown:
+        warning = (f"the reference block has no numbers for bucket(s) "
+                   f"{', '.join(unknown)}: POSITION_BUCKETS has been changed since "
+                   "those were measured, so they cannot be compared row for row")
+    return rows, warning
+
+
+def _tf_block(title, rows, names, label_w, line_w):
+    """One block: a titled rule, then a row per label with the real-vs-shuffled gap."""
+    # Truncate rather than overflow: a title longer than the table swallows the rule
+    # and the block stops looking like a block.
+    rule = f"--- {title} "
+    print(rule.ljust(line_w, "-") if len(rule) < line_w
+          else rule[:line_w - 4] + " ---")
+    out = []
+    for label, values in rows:
+        gap = _pct_gap(values.get("real"), values.get("shuffled"))
+        cells = "".join(_fmt(values.get(n), width=11, prec=4) for n in names)
+        gap_cell = f"{gap:>+13.1f}%" if gap is not None else f"{'n/a':>14}"
+        indent = "" if label == "mean" else "  "
+        print(f"{indent + label:<{label_w}}{cells}{gap_cell}")
+        out.append({"row": label, "values": {n: values.get(n) for n in names},
+                    "real_vs_shuffled_pct": gap})
+    return out
+
+
+def print_teacher_forced_comparison(tf_summaries, task_stream):
+    """Two blocks, same row labels, each with its own per-bucket gap.
+
+    Stacked rather than interleaved so a row reads down the page: the measured
+    number, then what the same row was when the target sat inside the resampler's
+    stream. The gap column is what to compare -- the absolute losses moved for a
+    second reason (the resampler is reading a different stream), but the gap is
+    within-block and says how much each configuration depended on getting the right
+    ECG.
+    """
+    names = [n for n, _ in CONDITIONS if n in tf_summaries]
+    if not names:
+        return None
+    label_w = 22
+    line_w = label_w + 11 * len(names) + 14
+    header = (f"{'':<{label_w}}" + "".join(f"{n:>11}" for n in names)
+              + f"{'real vs shuf':>14}")
+
+    print("\n" + "=" * line_w)
+    print("TEACHER-FORCED LOSS BY CONDITION")
+    print("=" * line_w)
+    print(header)
+
+    measured_rows = [("mean", {n: tf_summaries[n]["mean_loss"] for n in names})]
+    for k, label in enumerate(POSITION_BUCKET_LABELS):
+        vals = {}
+        for n in names:
+            per_pos = tf_summaries[n].get("per_position") or []
+            vals[n] = per_pos[k]["mean_loss"] if k < len(per_pos) else None
+        measured_rows.append((f"positions {label}", vals))
+
+    measured_title = f"measured now, --task-stream {task_stream}"
+    measured = _tf_block(measured_title, measured_rows, names, label_w, line_w)
+
+    reference_rows, warning = _reference_rows()
+    reference = _tf_block("run 1 reference, contaminated (target in the stream)",
+                          reference_rows, names, label_w, line_w)
+    print("-" * line_w)
+
+    if warning:
+        print(f"  WARNING: {warning}")
+    if task_stream != "prompt":
+        print("  NOTE: this run used the same contaminated stream as the reference, so")
+        print("        the two blocks should agree; treat a difference as a change in")
+        print("        the data or the checkpoint, not as a finding about the ECG.")
+
+    support = (tf_summaries[names[0]].get("per_position") or [])
+    if support:
+        print("  bucket support (real): " + "  ".join(
+            f"{r['positions']} n={r['n_positions']:,}/{r['n_examples']}ex"
+            for r in support))
+    print("  examples scored: " + "  ".join(
+        f"{n} {tf_summaries[n]['n_scored']:,}" for n in names))
+
+    print("\n  Read the gap column down, row against row. In the reference block it")
+    print("  peaks at positions 0-9 (+266%): with the answer inside the stream the")
+    print("  opening tokens were nearly free, and only there did the wrong ECG cost")
+    print("  anything. That mechanism is gone in a prompt-only run, so a gap in the")
+    print("  measured block is about the waveform rather than about the leak.")
+    print("  zeroed is the floor: no prefix information at all. real sitting at the")
+    print("  zeroed loss means the prefix carries nothing usable; real sitting at the")
+    print("  shuffled loss means it carries something that is not this record's ECG.")
+    return {"task_stream": task_stream,
+            "measured": {"title": measured_title, "rows": measured},
+            "reference": {"title": "run 1, contaminated", "rows": reference,
+                          "warning": warning}}
 
 
 def _fmt(v, width=8, prec=3):
@@ -241,7 +452,9 @@ def main():
     tf_indices = list(range(min(args.tf_limit, len(base))))
     print(f"\n{len(gen_indices)} examples per generation condition "
           f"({len(CONDITIONS)} conditions, batch {args.batch_size}); "
-          f"{len(tf_indices)} for the teacher-forced pass")
+          f"{len(tf_indices)} per teacher-forced condition "
+          f"({len(CONDITIONS)} conditions, batch {args.tf_batch_size}, "
+          f"task stream {args.task_stream})")
     # The same examples in every condition: identical indices over the same split, and
     # the permutation changes only which embedding each record is served.
     keys = [(base.examples[i].ecg_id, base.examples[i].superclass) for i in gen_indices]
@@ -268,21 +481,35 @@ def main():
         )
         by_condition[name] = records
 
-    tf_summary = None
+    tf_summaries = {}
+    tf_comparison = None
     if not args.skip_teacher_forced:
-        tf_path = os.path.join(args.out_dir, f"{args.tag}_{args.split}_teacher_forced.jsonl")
-        paths["teacher_forced"] = tf_path
-        print("\n" + "#" * 64)
-        print(f"# TEACHER-FORCED LOSS  ->  {tf_path}")
-        print("#" * 64, flush=True)
-        tf_records, _ = run_teacher_forced(
-            ctx, base, tf_indices, split=args.split, seed=args.seed,
-            shuffled=False, zero_latents=False, batch_size=args.tf_batch_size,
-            num_workers=args.num_workers, max_length=args.max_length,
-            out_path=tf_path, log_every=args.log_every,
-        )
-        tf_summary = summarise_teacher_forced(tf_records)
-        print_teacher_forced(tf_summary)
+        tf_by_condition = {}
+        for name, opts in CONDITIONS:
+            tf_path = os.path.join(
+                args.out_dir, f"{args.tag}_{args.split}_teacher_forced_{name}.jsonl")
+            paths[f"teacher_forced_{name}"] = tf_path
+            print("\n" + "#" * 64)
+            print(f"# TEACHER-FORCED LOSS: {name}  ->  {tf_path}")
+            print("#" * 64, flush=True)
+            # Same indices, same split, same order for all three; only the embedding
+            # a record is served and whether the prefix is zeroed change.
+            dataset = shuffled_view if opts["shuffled"] else base
+            tf_records, _ = run_teacher_forced(
+                ctx, dataset, tf_indices, split=args.split, seed=args.seed,
+                shuffled=opts["shuffled"], zero_latents=opts["zero_latents"],
+                batch_size=args.tf_batch_size, num_workers=args.num_workers,
+                max_length=args.max_length, out_path=tf_path,
+                log_every=args.log_every, task_stream=args.task_stream,
+            )
+            tf_by_condition[name] = tf_records
+            tf_summaries[name] = summarise_teacher_forced(tf_records)
+            print_teacher_forced(tf_summaries[name])
+
+        print("\nsample check:")
+        assert_same_examples(tf_by_condition, "teacher-forced conditions")
+        # The table itself is printed once, at the end of the run: it is the
+        # conclusion, and two blocks of six rows is too much to repeat.
 
     # ---- per-condition metrics, then the comparison ------------------------
     summaries = {name: condition_summary(recs) for name, recs in by_condition.items()}
@@ -294,8 +521,12 @@ def main():
         metrics[name] = compute_all_metrics(recs)
         print_metrics(metrics[name])
 
+    print("\nsample check:")
+    assert_same_examples(by_condition, "generation conditions")
     identical = identical_counts(by_condition)
-    print_comparison(summaries, identical, tf_summary)
+    print_comparison(summaries, identical, tf_summaries.get("real"))
+    if tf_summaries:
+        tf_comparison = print_teacher_forced_comparison(tf_summaries, args.task_stream)
 
     elapsed = time.time() - t_start
     summary_path = os.path.join(args.out_dir, f"{args.tag}_{args.split}_summary.json")
@@ -304,11 +535,15 @@ def main():
             "split": args.split, "checkpoint": args.ckpt, "model_dir": args.model_dir,
             "seed": args.seed, "limit": args.limit, "tf_limit": args.tf_limit,
             "batch_size": args.batch_size, "max_new_tokens": args.max_new_tokens,
+            "task_stream": args.task_stream,
             "files": paths,
             "conditions": summaries,
             "identical": identical,
             "metrics": metrics,
-            "teacher_forced": tf_summary,
+            # one summary per condition now, not a single pass; the old single-dict
+            # shape is gone, so anything reading this key needs the condition name
+            "teacher_forced": tf_summaries,
+            "teacher_forced_comparison": tf_comparison,
             "elapsed_seconds": round(elapsed, 1),
         }, f, indent=2)
     print(f"\ntotal {elapsed/60:.1f} min")

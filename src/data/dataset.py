@@ -460,6 +460,47 @@ def _format_prompt(tokenizer, user_content: str, strip_think: bool = False) -> s
     return f"<|user|>\n{user_content}\n<|assistant|>\n"
 
 
+TASK_STREAM_MODES = ("prompt", "prompt-and-target")
+
+
+def prompt_only_task_mask(
+    attention_mask: torch.Tensor, labels: torch.Tensor
+) -> torch.Tensor:
+    """The resampler's task-stream mask restricted to the real PROMPT tokens.
+
+    Both training and evaluation build this mask here, for the same reason
+    :func:`_format_prompt` builds prompts here: the resampler's second stream has to
+    carry the same thing in both, and two copies of this expression would drift.
+
+    ``attention_mask & (labels == -100)`` is exactly the prompt because of how
+    :func:`make_collate_fn` lays a batch out:
+
+        position        attention_mask   labels     in the intersection?
+        prompt token         1            -100      YES
+        target token         1            token id  no  (labels != -100)
+        right padding        0            -100      no  (attention_mask == 0)
+
+    so the two conditions between them exclude the target and the padding and
+    nothing else. That makes this expression correct only as long as the collate
+    keeps masking the whole prompt and nothing but the prompt -- an implicit
+    coupling, not a property of the tensors. If anyone ever supervises part of the
+    prompt, those positions silently leave this mask, and the resampler's stream
+    silently shortens. tests/test_task_stream.py derives the prompt length
+    independently (the leading run of -100) and asserts the two agree, so that
+    change breaks a test instead of quietly changing what the model reads.
+
+    Returns a bool tensor shaped like ``attention_mask``; pass it as the resampler's
+    ``task_mask``, where True means "attend to this position" (see
+    src/model/resampler.py's forward).
+    """
+    if attention_mask.shape != labels.shape:
+        raise ValueError(
+            f"attention_mask {tuple(attention_mask.shape)} and labels "
+            f"{tuple(labels.shape)} must share a shape; they come from the same "
+            "collate and describe the same positions")
+    return attention_mask.bool() & (labels == -100)
+
+
 def make_collate_fn(
     tokenizer,
     max_length: int = 1024,

@@ -39,7 +39,13 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for probe_memory
 
-from src.data.dataset import DatasetConfig, build_datasets, make_collate_fn  # noqa: E402
+from src.data.dataset import (  # noqa: E402
+    TASK_STREAM_MODES,
+    DatasetConfig,
+    build_datasets,
+    make_collate_fn,
+    prompt_only_task_mask,
+)
 from src.model.resampler import (  # noqa: E402
     PerceiverResamplerConfig,
     Resampler,
@@ -91,6 +97,14 @@ def parse_args():
                          "the block stack produces -- the reference behaviour. There "
                          "is then nothing for --prefix-scale to calibrate, so the two "
                          "flags are mutually exclusive unless the scale is 1.0")
+    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default="prompt",
+                    help="what the RESAMPLER's task-text stream may read. 'prompt' "
+                         "(default) is the real prompt tokens only, which is what "
+                         "generation feeds it. 'prompt-and-target' is what run 1 "
+                         "trained on: the target is in the stream, so the resampler "
+                         "can read the answer it will not have at inference. Neither "
+                         "setting changes what the LLM receives or where the loss "
+                         "lands -- only the resampler's second stream")
     ap.add_argument("--strip-think", action="store_true",
                     help="strip the template's trailing open <think> block from the "
                          "prompt. OFF by default, matching run 1; evaluation must be "
@@ -272,11 +286,12 @@ def build_loaders(args, tokenizer, data_cfg):
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def validate(model, resampler, val_loader, dev):
+def validate(model, resampler, val_loader, dev, task_stream: str = "prompt"):
     resampler.eval()
     losses = []
     for batch in val_loader:
-        losses.append(float(splice_forward(model, resampler, batch, dev).detach()))
+        losses.append(float(splice_forward(model, resampler, batch, dev,
+                                           task_stream=task_stream).detach()))
     resampler.train()
     return sum(losses) / max(len(losses), 1)
 
@@ -286,7 +301,7 @@ def _log_mem():
 
 
 @torch.no_grad()
-def prefix_scale_line(model, resampler, batch, dev):
+def prefix_scale_line(model, resampler, batch, dev, task_stream: str = "prompt"):
     """Where the prefix actually sits, relative to the tokens it is spliced against.
 
     The LayerNorm gain is initialised to put the latents on the student's embedding
@@ -304,9 +319,12 @@ def prefix_scale_line(model, resampler, batch, dev):
     ecg = batch["ecg_embed"].to(dev)
     input_ids = batch["input_ids"].to(dev)
     attn = batch["attention_mask"].to(dev)
+    labels = batch["labels"].to(dev)
+    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
+                 else attn.bool())
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=attn.bool())
+        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask)
     lat = float(latents.float().norm(dim=-1).mean())
     tok = float(tok_embeds.float().norm(dim=-1)[attn.bool()].mean())
     out_norm = getattr(resampler, "output_norm", None)
@@ -325,7 +343,8 @@ def train_overfit(model, resampler, optimizer, loader, dev, args):
     while step < args.overfit_max_steps:
         for batch in loader:
             t0 = time.time()
-            loss = splice_forward(model, resampler, batch, dev)
+            loss = splice_forward(model, resampler, batch, dev,
+                                  task_stream=args.task_stream)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if not checked:                       # one-time grad-flow gate
@@ -339,7 +358,8 @@ def train_overfit(model, resampler, optimizer, loader, dev, args):
                   flush=True)
             if step == 1 or step % args.prefix_log_every == 0:
                 print(f"    prefix scale @ step {step}: "
-                      f"{prefix_scale_line(model, resampler, batch, dev)}", flush=True)
+                      f"{prefix_scale_line(model, resampler, batch, dev, args.task_stream)}",
+                      flush=True)
             if lv <= args.overfit_target_loss:
                 print(f"GATE PASSED: loss {lv:.4f} <= {args.overfit_target_loss} at step {step}")
                 return True
@@ -357,7 +377,8 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
         window_t0 = time.time()
         running = []
         for batch in train_loader:
-            loss = splice_forward(model, resampler, batch, dev)
+            loss = splice_forward(model, resampler, batch, dev,
+                                  task_stream=args.task_stream)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if global_step == 0:                  # one-time grad-flow gate
@@ -386,7 +407,7 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
                                 best_val, is_best=False)
                 sys.exit(0)
 
-        val_loss = validate(model, resampler, val_loader, dev)
+        val_loss = validate(model, resampler, val_loader, dev, args.task_stream)
         is_best = val_loss < best_val
         best_val = min(best_val, val_loss)
         print(f"== epoch {epoch} done  train_loss "
@@ -402,6 +423,7 @@ def main():
         args.lr = 1e-4 if args.overfit is not None else 1e-5
     _RUN_META.update({
         "prefix_scale": args.prefix_scale,
+        "task_stream": args.task_stream,
         "input_layer_norm": not args.no_input_norm,
         "final_output_norm": not args.no_output_norm,
         "strip_think": bool(args.strip_think),
