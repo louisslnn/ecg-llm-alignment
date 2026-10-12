@@ -67,6 +67,53 @@ def test_training_checkpoints_record_strip_think(tmp_path, monkeypatch):
         assert checkpoint_strip_think(str(ckpt_dir)) == (value, True)
 
 
+def test_overfit_final_reads_back_like_any_training_checkpoint(tmp_path, monkeypatch, capsys):
+    """--overfit's final resampler goes through the same two readers, unchanged.
+
+    The gate's resampler is only worth saving if what probes a training checkpoint
+    can probe it: same keys bar the optimizer, strip_think in the meta, weights that
+    load strictly -- plus the verdict and the arguments, for a failed gate as well.
+    """
+    import train
+    from src.model.resampler import PerceiverResamplerConfig, Resampler
+
+    def tiny(**overrides):          # load_resampler builds .ecg(); 3.4 GB is no unit test
+        return PerceiverResamplerConfig(embed_dim=32, ffn_embed_dim=64, attention_heads=4,
+                                        num_layers=1, resampled_length=4,
+                                        input_embed_dim=16, **overrides)
+
+    monkeypatch.setattr(PerceiverResamplerConfig, "ecg", staticmethod(tiny))
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [])   # no GPU here
+    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", "--overfit", "50",
+                                      "--no-strip-think"])
+    args = train.parse_args()
+    monkeypatch.setitem(train._RUN_META, "strip_think", bool(args.strip_think))
+
+    module = torch.nn.Linear(2, 2)
+    reference = torch.load(
+        train.save_checkpoint(str(tmp_path), module, torch.optim.AdamW(module.parameters()),
+                              epoch=0, step=1, best_val=1.0, is_best=False),
+        weights_only=False)
+
+    ckpt_dir = tmp_path / "gate"
+    ckpt_dir.mkdir()
+    for passed in (True, False):                   # the second write replaces the first
+        resampler = Resampler(tiny())
+        path = train.save_overfit_final(str(ckpt_dir), resampler, epoch=3, step=40,
+                                        gate_passed=passed, args=args)
+        assert os.listdir(ckpt_dir) == ["overfit_final.pt"]
+        assert checkpoint_strip_think(path) == (False, True)
+        loaded = evaluate.load_resampler(path, torch.device("cpu"))
+        assert "epoch 3 step 40" in capsys.readouterr().out
+        for key, value in resampler.state_dict().items():
+            assert torch.equal(loaded.state_dict()[key], value)
+
+        payload = torch.load(path, weights_only=False)
+        assert set(payload) == (set(reference) - {"optimizer"}) | {"gate_passed", "args"}
+        assert payload["gate_passed"] is passed
+        assert payload["args"] == vars(args)
+
+
 @pytest.mark.parametrize("meta", ["absent", {}, {"prefix_scale": 1.0}, None])
 def test_missing_value_is_false_and_reported_as_inferred(tmp_path, capsys, meta):
     """Run 1's checkpoint has no entry: that means the think block was in the prompt."""

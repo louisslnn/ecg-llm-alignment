@@ -468,11 +468,17 @@ class ShuffledEmbeddings(torch.utils.data.Dataset):
     receive the same donor -- the model gets one consistent wrong heart per record,
     not five. Built as a single cycle over a seeded shuffle, which guarantees no
     record keeps its own embedding.
+
+    ``ecg_ids`` restricts the permutation to those records (default: every record in
+    ``base``), for a caller that evaluates a slice and needs every donor drawn from
+    inside it. An example of any other record is then a KeyError rather than a
+    silent pass-through of its own embedding.
     """
 
-    def __init__(self, base, seed: int):
+    def __init__(self, base, seed: int, ecg_ids: Optional[Sequence[int]] = None):
         self.base = base
-        ids = sorted({e.ecg_id for e in base.examples})
+        ids = sorted({e.ecg_id for e in base.examples} if ecg_ids is None
+                     else {int(i) for i in ecg_ids})
         if len(ids) < 2:
             raise ValueError("need at least 2 records to permute embeddings")
         order = [int(i) for i in np.random.default_rng(seed).permutation(ids)]
@@ -1286,6 +1292,9 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
           + ("  [ZERO-LATENTS CONTROL]" if zero_latents else ""))
 
     mismatch = bool(ctx.strip_think_check.get("strip_think_mismatch", False))
+    # Training's collate does not carry donor_ecg_id through, so the donor is read
+    # from the wrapper's mapping -- the dict __getitem__ serves the embedding from.
+    donors = dataset.mapping if isinstance(dataset, ShuffledEmbeddings) else None
     records: List[dict] = []
     t0 = time.time()
     for bi, batch in enumerate(loader):
@@ -1309,6 +1318,9 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                 "shuffled_embeddings": bool(shuffled),
                 "zero_latents": bool(zero_latents),
                 "strip_think_mismatch": mismatch,   # only under the escape hatch
+                # None unless the dataset really is the shuffled view, whatever
+                # ``shuffled`` says: the flag is a label, the wrapper is the shuffle
+                "donor_ecg_id": donors[int(batch["ecg_id"][b])] if donors else None,
                 "seed": seed,
             })
         if log_every and (bi + 1) % log_every == 0:

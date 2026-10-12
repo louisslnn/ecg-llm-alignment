@@ -72,10 +72,12 @@
 # is what matters and the best of the three is the one to keep. With
 # --no-output-norm there is no gain, so that line carries only the norms.
 #
-# NOTE: --overfit never writes a checkpoint, so the per-run directory holds only
-# the gate's per-example records (gate_teacher_forced.jsonl, gate_generations.jsonl).
-# It is per run so queued jobs cannot share or clobber state, and so a non-gate
-# rerun with the same CKPT_DIR lands somewhere of its own.
+# NOTE: --overfit writes nothing it can resume from. The per-run directory holds
+# the gate's per-example records (gate_teacher_forced_{real,shuffled,zeroed}.jsonl,
+# gate_generations.jsonl) and, once the gate has run, overfit_final.pt: the
+# resampler it judged, pass or fail, ~3.4 GB per sweep point. It is per run so
+# queued jobs cannot share or clobber state, and so a non-gate rerun with the same
+# CKPT_DIR lands somewhere of its own.
 #
 # THE TIME BUDGET. At ~0.45 s/step and batch 4, plus a ~15 min model load:
 #   400 steps  (~32 passes over the 50 examples)  ~3 min   -> ~18 min total
@@ -84,8 +86,8 @@
 # and the gate's own passes -- 50 greedy decodes at batch 1, a few minutes when the
 # generations close and up to 512 tokens each when they do not.
 # The 1:30 bin holds 3000 comfortably. Raise --time before raising --steps much
-# past that: the gate is killed mid-run at the limit, and since --overfit writes no
-# checkpoint there is nothing to resume from.
+# past that: the gate is killed mid-run at the limit, and since --overfit writes
+# overfit_final.pt only once the gate has run, there is nothing to resume from.
 #
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 set -euo pipefail

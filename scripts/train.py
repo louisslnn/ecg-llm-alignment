@@ -16,6 +16,8 @@ best.pt (lowest val loss) are kept.
     # the gate: overfit 50 examples, then show it three ways on those same 50 --
     # teacher-forced loss, free generation, and the loss at the Yes/No token for
     # each label separately (scripts/overfit_gate.py). Exits 0 only if all three pass.
+    # Pass or fail, the resampler the gate judged is left in --ckpt-dir as
+    # overfit_final.pt (~3.4 GB), so it can be probed without retraining it.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50
 
     # full run (auto-resumes)
@@ -250,6 +252,7 @@ def preflight(args, data_cfg):
 # --------------------------------------------------------------------------- #
 
 _STEP_RE = re.compile(r"ckpt_step(\d+)\.pt$")
+OVERFIT_FINAL = "overfit_final.pt"
 
 
 def _rotating(ckpt_dir):
@@ -257,11 +260,10 @@ def _rotating(ckpt_dir):
                   key=lambda p: int(_STEP_RE.search(p).group(1)))
 
 
-def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_best,
-                    meta=None):
-    payload = {
+def _payload(resampler, epoch, step, best_val, meta=None):
+    """What every checkpoint carries; evaluate.py reads these keys."""
+    return {
         "resampler": resampler.state_dict(),
-        "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "global_step": step,
         "best_val_loss": best_val,
@@ -275,6 +277,12 @@ def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_be
             "python": random.getstate(),
         },
     }
+
+
+def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_best,
+                    meta=None):
+    payload = _payload(resampler, epoch, step, best_val, meta)
+    payload["optimizer"] = optimizer.state_dict()
     path = os.path.join(ckpt_dir, f"ckpt_step{step}.pt")
     torch.save(payload, path + ".tmp")
     os.replace(path + ".tmp", path)          # atomic
@@ -285,6 +293,28 @@ def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_be
     # keep only the last 2 rotating checkpoints (best.pt is separate, never pruned)
     for old in _rotating(ckpt_dir)[:-2]:
         os.remove(old)
+    return path
+
+
+def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
+    """Write the resampler the gate just judged to ``ckpt_dir/overfit_final.pt``.
+
+    Written on a failed gate as much as a passed one: the failing resampler is the
+    one worth probing, and without this it has to be retrained to ask it anything
+    the gate did not. The payload is a training checkpoint's -- the same keys, the
+    same meta with strip_think -- so evaluate.load_resampler and
+    evaluate.checkpoint_strip_think read it as they read any other, plus the gate's
+    verdict and the run's full arguments. It has no optimizer state: nothing resumes
+    from it (resume() only looks at ckpt_step*.pt), and AdamW's two moments would
+    triple the ~3.4 GB the fp32 weights take. best_val_loss is inf, as in any
+    checkpoint written before a validation pass: --overfit has no validation.
+    """
+    payload = _payload(resampler, epoch, step, float("inf"))
+    payload["gate_passed"] = bool(gate_passed)
+    payload["args"] = dict(vars(args))
+    path = os.path.join(ckpt_dir, OVERFIT_FINAL)
+    torch.save(payload, path + ".tmp")
+    os.replace(path + ".tmp", path)          # atomic
     return path
 
 
@@ -409,6 +439,8 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
     Reaching the target is still NOT the gate: run 1 reached 0.0496 and its free
     generation was degenerate. The caller runs the gate on the result either way, so
     a run that stops at the cap still reports all three conditions.
+
+    Returns the number of steps taken.
     """
     n_examples = sum(len(b["ecg_id"]) for b in eval_batches)
     print(f"overfit: train until the eval-mode mean loss over all {n_examples} "
@@ -447,12 +479,12 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
                 if mean <= args.overfit_target_loss:
                     print(f"overfit stopped: eval-mode mean {mean:.4f} <= "
                           f"{args.overfit_target_loss} at step {step}")
-                    return True
+                    return step
             if step >= args.overfit_max_steps:
                 break
     print(f"overfit stopped: eval-mode mean did NOT reach {args.overfit_target_loss} "
           f"in {step} steps; the gate runs regardless")
-    return False
+    return step
 
 
 def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
@@ -596,12 +628,26 @@ def main():
         # order, through the same batches.
         overfit_set = train_loader.dataset          # the Subset build_loaders made
         dataset, indices = overfit_set.dataset, list(overfit_set.indices)
-        train_overfit(model, resampler, optimizer, train_loader,
-                      gate_batches(tokenizer, dataset, indices, args), dev, args)
+        steps = train_overfit(model, resampler, optimizer, train_loader,
+                              gate_batches(tokenizer, dataset, indices, args), dev, args)
         # Drop the last step's gradients first: nothing below needs them.
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         ok = run_gate(model, resampler, tokenizer, dataset, indices, args)
+        # After the gate, so the file carries the verdict on the weights it holds.
+        # A write that fails (scratch quota) is said on the closing line and does not
+        # touch the exit code: that is the gate's verdict, and an uncaught error here
+        # would exit 1 on a gate that passed.
+        verdict = f"gate {'PASSED' if ok else 'FAILED'}"
+        try:
+            path = save_overfit_final(args.ckpt_dir, resampler,
+                                      steps // len(train_loader), steps, ok, args)
+        except (OSError, RuntimeError) as err:
+            print(f"{verdict}; the resampler it judged (step {steps}) was NOT saved to "
+                  f"{os.path.join(args.ckpt_dir, OVERFIT_FINAL)}: {err}", flush=True)
+        else:
+            print(f"{verdict}; the resampler it judged (step {steps}) is in {path}",
+                  flush=True)
         sys.exit(0 if ok else 1)
 
     start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer, dev)

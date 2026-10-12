@@ -20,8 +20,8 @@
 #      the targets', and the generated Yes/No matches the label on >= 90%
 #   3. loss at the Yes/No token below 0.1 for label=True and label=False separately
 # All three print with their thresholds either way; exit 0 only if all pass, exit 1
-# with the failed conditions named on the last line. The loss alone is not the gate:
-# run 1 reached 0.0496 and its free generation was still degenerate.
+# with the failed conditions named on the GATE FAILED line. The loss alone is not the
+# gate: run 1 reached 0.0496 and its free generation was still degenerate.
 #
 # The two hours are sized for the WORST case, so that a job killed at the limit is
 # not what a failing gate looks like in sacct: ~15 min model load, the overfit run
@@ -30,8 +30,14 @@
 # TIMEOUT means the budget was wrong, not that the gate failed. If --overfit-max-steps
 # goes up, raise --time with it.
 #
-# The gate's per-example records (gate_teacher_forced.jsonl, gate_generations.jsonl)
-# land in CKPT_DIR, on scratch.
+# The gate's per-example records (gate_teacher_forced_{real,shuffled,zeroed}.jsonl,
+# gate_generations.jsonl) land in CKPT_DIR, on scratch. The shuffled and zeroed
+# files are the diagnostic controls; the verdict reads the real one alone.
+#
+# overfit_final.pt lands there too: the resampler the gate judged, written once the
+# gate has run whether it passed or failed (~3.4 GB; no optimizer state, so it is
+# for probing with --ckpt, not for resuming). The log's last line repeats the
+# verdict and gives its path.
 #
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 # Submit from the repo root after `mkdir -p logs`:
