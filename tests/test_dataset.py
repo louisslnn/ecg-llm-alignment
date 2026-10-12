@@ -12,6 +12,7 @@ collate test runs on CPU.
 import json
 import os
 import random
+import re
 import sys
 
 import numpy as np
@@ -202,15 +203,87 @@ class _ThinkTemplateTokenizer:
         return text
 
 
-def test_think_block_is_kept_by_default():
-    """OFF by default: the prompt must stay byte-identical to what run 1 trained on.
+def test_think_block_is_stripped_by_default_and_keeping_it_stays_reachable():
+    """ON by default, in the config and in the helper's own default alike.
 
-    The sweep varies the prefix scale alone, so a silent prompt change here would
-    make every comparison against run 1 meaningless.
+    The two defaults are asserted together because a caller that builds a prompt
+    without passing the flag gets the helper's, and one that disagreed with the
+    config would put the block back without anyone asking for it. False must still
+    work: runs 1 and 2 trained with the block, and evaluating them needs it.
     """
-    assert DatasetConfig().strip_think is False
+    assert DatasetConfig().strip_think is True
     tok = _ThinkTemplateTokenizer()
-    assert _format_prompt(tok, "Is this a normal ECG?").endswith("<|Assistant|><think>\n")
+    assert _format_prompt(tok, "Is this a normal ECG?").endswith("<|Assistant|>")
+
+    assert DatasetConfig(strip_think=False).strip_think is False
+    kept = _format_prompt(tok, "Is this a normal ECG?", strip_think=False)
+    assert kept.endswith("<|Assistant|><think>\n")
+
+
+def _think_tokenizers():
+    """Tokenizers whose generation prompt ends in an open think block.
+
+    The debug 0.5B with ``<think>\\n`` appended to its generation prompt always
+    runs; the real 14B tokenizer, whose own template renders the block, is added
+    where it is on disk.
+    """
+    from transformers import AutoTokenizer
+
+    stand_in = load_student_tokenizer(CONFIG)
+    stand_in.chat_template += "{% if add_generation_prompt %}{{ '<think>\n' }}{% endif %}"
+    toks = [("debug tokenizer + think template", stand_in)]
+    try:
+        toks.append(("student tokenizer", AutoTokenizer.from_pretrained(
+            DatasetConfig().student_model, local_files_only=True)))
+    except Exception as err:                     # checkpoint not on this machine
+        print(f"student tokenizer unavailable ({type(err).__name__}); "
+              "stand-in template only")
+    return toks
+
+
+def test_no_think_block_ends_the_prompt_on_the_training_or_evaluation_path():
+    """Under the config's default, neither path conditions the student on <think>.
+
+    Each path is driven the way its script drives it -- the collate built with
+    ``DatasetConfig().strip_think`` -- and the prompt is read back out of the batch,
+    so this covers what the model receives rather than what ``_format_prompt``
+    returns. Training (and the teacher-forced evaluation) go through
+    ``make_collate_fn``; generation goes through evaluate.py's ``make_eval_collate``.
+    Each tokenizer is first shown to render the block when stripping is off, so a
+    template that never opens one cannot make this pass.
+    """
+    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    from evaluate import make_eval_collate
+
+    ends_in_think = re.compile(r"<think>\s*\Z")
+    items = [splits()["train"][i] for i in range(3)]
+
+    def training_prompts(tok, strip_think):
+        batch = make_collate_fn(tok, max_length=2048, strip_think=strip_think)(items)
+        ids, labels, attn = batch["input_ids"], batch["labels"], batch["attention_mask"]
+        return [tok.decode(ids[r][(labels[r] == -100) & (attn[r] == 1)],
+                           skip_special_tokens=False) for r in range(len(items))]
+
+    def evaluation_prompts(tok, strip_think):
+        batch = make_eval_collate(tok, max_prompt_length=1024, strip_think=strip_think)(items)
+        ids, attn = batch["input_ids"], batch["attention_mask"]
+        decoded = [tok.decode(ids[r][attn[r] == 1], skip_special_tokens=False)
+                   for r in range(len(items))]
+        return batch["prompt"] + decoded       # the rendered string and its tokens
+
+    default = DatasetConfig().strip_think
+    for name, tok in _think_tokenizers():
+        for path, prompts in (("training", training_prompts),
+                              ("evaluation", evaluation_prompts)):
+            for text in prompts(tok, False):
+                assert ends_in_think.search(text), (
+                    f"{name}, {path}: expected the template's open think block with "
+                    f"strip_think=False, got ...{text[-60:]!r}")
+            for text in prompts(tok, default):
+                assert not ends_in_think.search(text), (
+                    f"{name}, {path}: prompt still ends in an open think block: "
+                    f"...{text[-60:]!r}")
+                assert "<think>" not in text and "</think>" not in text
 
 
 def test_format_prompt_strips_the_trailing_think_block_when_asked():

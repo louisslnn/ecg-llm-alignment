@@ -50,9 +50,18 @@
 #
 # WHAT VARIES: --prefix-scale, the step cap, the LR and the two norm flags,
 # nothing else.
-# The prompt keeps the template's <think> block (DatasetConfig.strip_think is off by
-# default, as run 1 trained), so a difference between runs can only come from how
-# loud the prefix is and which norms are present.
+# The prompt has the template's trailing <think> block stripped
+# (DatasetConfig.strip_think, on by default), so a difference between runs can only
+# come from how loud the prefix is and which norms are present. Sweep points run
+# before that default changed kept the block, as runs 1 and 2 trained: they are a
+# different prompt and are not comparable with points run now.
+#
+# THE GATE IS THREE CONDITIONS, checked on the 50 examples once the overfit loop
+# stops (scripts/overfit_gate.py): teacher-forced loss, free greedy generation, and
+# the loss at the Yes/No token per label. The loop stops when the eval-mode mean
+# loss over all 50 (measured every 50 steps) reaches the target, which is condition
+# 1's own number; stopping is not passing, and the closing GATE PASSED / GATE FAILED
+# line is the verdict and names what failed.
 #
 # WHAT TO READ: the gate verdict (exit 0 = passed), the "resampler architecture"
 # line, and the "prefix scale @ step N" lines, which report the measured latent
@@ -63,14 +72,17 @@
 # is what matters and the best of the three is the one to keep. With
 # --no-output-norm there is no gain, so that line carries only the norms.
 #
-# NOTE: --overfit never writes a checkpoint (the gate exits as soon as it passes or
-# runs out of steps), so the per-run directory will be empty. It exists so queued
-# jobs cannot share or clobber state, and so a non-gate rerun with the same
-# CKPT_DIR lands somewhere of its own.
+# NOTE: --overfit never writes a checkpoint, so the per-run directory holds only
+# the gate's per-example records (gate_teacher_forced.jsonl, gate_generations.jsonl).
+# It is per run so queued jobs cannot share or clobber state, and so a non-gate
+# rerun with the same CKPT_DIR lands somewhere of its own.
 #
 # THE TIME BUDGET. At ~0.45 s/step and batch 4, plus a ~15 min model load:
 #   400 steps  (~32 passes over the 50 examples)  ~3 min   -> ~18 min total
 #   3000 steps (~240 passes)                      ~23 min  -> ~38 min total
+# On top of either: a no-grad pass over the 50 every 50 steps for the stop rule,
+# and the gate's own passes -- 50 greedy decodes at batch 1, a few minutes when the
+# generations close and up to 512 tokens each when they do not.
 # The 1:30 bin holds 3000 comfortably. Raise --time before raising --steps much
 # past that: the gate is killed mid-run at the limit, and since --overfit writes no
 # checkpoint there is nothing to resume from.

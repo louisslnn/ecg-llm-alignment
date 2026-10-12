@@ -154,13 +154,15 @@ class DatasetConfig:
     teacher_path: str = os.path.join(REPO_ROOT, "data", "teacher", "full_v6_final.jsonl")
 
     # Strip the trailing open <think> block the reasoning template appends to the
-    # generation prompt (see :data:`_TRAILING_THINK_RE`). OFF by default: run 1
-    # trained with the block present, and every comparison against it has to keep
-    # the prompt byte-identical. Turning this on changes the prompt, so a run with
-    # it on is a different experiment, not a variation of the same one -- and it
-    # must be set the SAME WAY for training and evaluation, or the student is
-    # scored on a prompt it never saw.
-    strip_think: bool = False
+    # generation prompt (see :data:`_TRAILING_THINK_RE`). ON by default: the targets
+    # never close a think block, so leaving it open trains the student to write its
+    # answer inside one. Runs 1 and 2 trained with the block present, so this
+    # default is a different prompt from theirs -- a different experiment, not a
+    # variation of the same one. False stays reachable (``--no-strip-think`` on the
+    # scripts) and is REQUIRED to evaluate or compare against a checkpoint trained
+    # that way: it must be set the SAME WAY for training and evaluation, or the
+    # student is scored on a prompt it never saw.
+    strip_think: bool = True
 
     # The student LLM. `debug` swaps in the 0.5B model so tokenisation (and the
     # rest of the training loop) runs on CPU locally.
@@ -441,14 +443,15 @@ def load_student_tokenizer(config: Optional[DatasetConfig] = None):
 _TRAILING_THINK_RE = re.compile(r"<think>\s*\Z")
 
 
-def _format_prompt(tokenizer, user_content: str, strip_think: bool = False) -> str:
+def _format_prompt(tokenizer, user_content: str, strip_think: bool = True) -> str:
     """Wrap the student prompt in the chat template, turn left open for the target.
 
-    With ``strip_think`` the rendered prompt ends at the assistant tag and carries no
-    open think block (see :data:`_TRAILING_THINK_RE`); without it the template's own
-    output is used verbatim, which is what run 1 trained on. Training and evaluation
-    both build prompts here, so they cannot drift apart on anything EXCEPT this flag
-    -- pass it from :class:`DatasetConfig` on both sides.
+    With ``strip_think`` (the default, as in :class:`DatasetConfig`) the rendered
+    prompt ends at the assistant tag and carries no open think block (see
+    :data:`_TRAILING_THINK_RE`); with it False the template's own output is used
+    verbatim, which is what runs 1 and 2 trained on. Training and evaluation both
+    build prompts here, so they cannot drift apart on anything EXCEPT this flag --
+    pass it from :class:`DatasetConfig` on both sides.
     """
     if getattr(tokenizer, "chat_template", None):
         rendered = tokenizer.apply_chat_template(
@@ -505,7 +508,7 @@ def make_collate_fn(
     tokenizer,
     max_length: int = 1024,
     prefix_text: str = DEFAULT_PREFIX_TEXT,
-    strip_think: bool = False,
+    strip_think: bool = True,
 ) -> Callable[[Sequence[Dict[str, Any]]], Dict[str, Any]]:
     """Build a collate function bound to a tokenizer.
 

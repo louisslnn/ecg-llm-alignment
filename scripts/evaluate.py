@@ -99,7 +99,7 @@ import os
 import sys
 import time
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -175,10 +175,17 @@ def parse_args():
                          "input_ids are the prompt already, so it is prompt-only "
                          "whatever this says -- which is the mismatch the flag exists "
                          "to measure. Neither setting changes the loss positions")
-    ap.add_argument("--strip-think", action="store_true",
+    ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
+                    default=DatasetConfig.strip_think,
                     help="strip the template's trailing open <think> block from the "
                          "prompt. MUST match what training used (train.py's own "
-                         "--strip-think); off by default, as run 1 trained")
+                         "--strip-think). ON by default; pass --no-strip-think for a "
+                         "checkpoint trained with the block, as runs 1 and 2 were")
+    ap.add_argument("--allow-strip-think-mismatch", action="store_true",
+                    help="run even though --strip-think disagrees with the value the "
+                         "checkpoint was trained with. Without this the script "
+                         "refuses; with it, it warns and marks the output, because "
+                         "the student is then scored on a prompt it never trained on")
     # the controls
     ap.add_argument("--shuffle-embeddings", action="store_true",
                     help="permute ECG embeddings across records within the split "
@@ -484,7 +491,7 @@ class ShuffledEmbeddings(torch.utils.data.Dataset):
         return item
 
 
-def make_eval_collate(tokenizer, max_prompt_length: int, strip_think: bool = False):
+def make_eval_collate(tokenizer, max_prompt_length: int, strip_think: bool = True):
     """Prompt-only collate, LEFT-padded for batched generation.
 
     Training right-pads because the target follows the prompt; generation continues
@@ -536,10 +543,80 @@ def make_eval_collate(tokenizer, max_prompt_length: int, strip_think: bool = Fal
 # --------------------------------------------------------------------------- #
 
 
+def resolve_ckpt_path(ckpt_path: str) -> str:
+    """A checkpoint file as given, or best.pt inside a checkpoint directory."""
+    return os.path.join(ckpt_path, "best.pt") if os.path.isdir(ckpt_path) else ckpt_path
+
+
+def checkpoint_strip_think(ckpt_path: str):
+    """``(value, recorded)``: the strip_think setting a checkpoint was trained with.
+
+    train.py writes it into the checkpoint's meta. A checkpoint with no such entry
+    predates the flag -- run 1's does -- and was therefore trained with the
+    template's open <think> block in the prompt: that is False, NOT whatever
+    DatasetConfig defaults to today, and ``recorded`` is False so the caller can say
+    the value was inferred.
+
+    Read with mmap so the multi-GB tensors are not pulled off disk just to look at a
+    dict; this runs before the student load, where failing costs seconds.
+    """
+    path = resolve_ckpt_path(ckpt_path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except (TypeError, RuntimeError, ValueError):    # older torch, or a legacy-format file
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    if isinstance(meta, dict) and meta.get("strip_think") is not None:
+        return bool(meta["strip_think"]), True
+    return False, False
+
+
+def require_strip_think_match(ckpt_path: str, strip_think: bool,
+                              allow_mismatch: bool = False,
+                              escape_flag: Optional[str] = "--allow-strip-think-mismatch"):
+    """Refuse to pair a checkpoint with a prompt format it was not trained on.
+
+    ``strip_think`` decides whether the prompt ends in an open <think> block. If
+    this run's setting differs from the checkpoint's, every number produced is about
+    a prompt the student never saw -- a train/inference mismatch that looks, in the
+    output, exactly like a model that learned nothing. So it is fatal, and the
+    message names both values. ``allow_mismatch`` turns the refusal into a printed
+    warning; the returned dict goes into the run's output so the result file carries
+    the mismatch as well as the log.
+
+    ``escape_flag`` is the flag the refusal points to; None for a caller that offers
+    no way through (resuming training).
+    """
+    trained, recorded = checkpoint_strip_think(ckpt_path)
+    source = ("recorded in its meta" if recorded else
+              "NOT recorded: the checkpoint predates the flag, so it is treated as "
+              "False -- trained with the template's open <think> block")
+    path = resolve_ckpt_path(ckpt_path)
+    print(f"checkpoint strip_think={trained} ({source}); this run strip_think="
+          f"{bool(strip_think)}", flush=True)
+    result = {"checkpoint_strip_think": trained,
+              "checkpoint_strip_think_recorded": recorded,
+              "strip_think_mismatch": trained != bool(strip_think)}
+    if not result["strip_think_mismatch"]:
+        return result
+
+    matching = "--strip-think" if trained else "--no-strip-think"
+    what = (f"strip_think MISMATCH: this run has strip_think={bool(strip_think)}, but "
+            f"the checkpoint {path} was trained with strip_think={trained} ({source}). "
+            "The prompt would differ from the one the resampler was trained against.")
+    if allow_mismatch:
+        bar = "!" * 78
+        print(f"\n{bar}\nWARNING: {what}\nContinuing because {escape_flag} was "
+              "passed. Every number below is measured on a prompt this checkpoint never "
+              f"trained on.\n{bar}\n", flush=True)
+        return result
+    sys.exit(f"{what}\nPass {matching} to match the checkpoint"
+             + (f", or {escape_flag} to run anyway." if escape_flag else "."))
+
+
 def load_resampler(ckpt_path: str, dev) -> Resampler:
     """Load the resampler weights from a training checkpoint (or a bare state dict)."""
-    if os.path.isdir(ckpt_path):
-        ckpt_path = os.path.join(ckpt_path, "best.pt")
+    ckpt_path = resolve_ckpt_path(ckpt_path)
     # our own checkpoint (trusted); it carries numpy/python RNG state that the
     # weights_only=True default (torch>=2.6) refuses to unpickle.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -1002,21 +1079,47 @@ class EvalContext:
     no_pos: List[int]
     capture: Any
     processors: Any
+    # What require_strip_think_match found; empty for a context built from_loaded,
+    # where the resampler was trained in this process under this config.
+    strip_think_check: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def load(cls, model_dir: str, ckpt: str, tokenizer=None) -> "EvalContext":
-        from transformers import AutoTokenizer, LogitsProcessorList
+    def load(cls, model_dir: str, ckpt: str, tokenizer=None, *, strip_think: bool,
+             allow_strip_think_mismatch: bool = False) -> "EvalContext":
+        """Load the student and a resampler checkpoint.
 
+        ``strip_think`` is the setting this run builds its prompts with, and is
+        required: the checkpoint is checked against it BEFORE the student loads, so
+        no script can evaluate a checkpoint without saying which prompt format it is
+        using, and a disagreement costs seconds rather than a model load.
+        """
+        from transformers import AutoTokenizer
+
+        check = require_strip_think_match(ckpt, strip_think, allow_strip_think_mismatch)
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
         print("loading frozen student (bf16, device_map=auto) ...")
         model = load_student(model_dir)
         model.config.use_cache = True  # load_student turns it off for the backward pass
         dev = next(model.get_input_embeddings().parameters()).device
-        resampler = load_resampler(ckpt, dev)
+        ctx = cls.from_loaded(model, load_resampler(ckpt, dev), tokenizer)
+        ctx.strip_think_check = check
+        return ctx
+
+    @classmethod
+    def from_loaded(cls, model, resampler, tokenizer) -> "EvalContext":
+        """A context over a student and resampler already in memory.
+
+        For a caller that has just trained the resampler and wants these passes on it
+        without a checkpoint round trip (the overfit gate, scripts/overfit_gate.py).
+        Nothing is loaded or modified here.
+        """
+        from transformers import LogitsProcessorList
+
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+        dev = next(model.get_input_embeddings().parameters()).device
 
         yes_ids, no_ids = yes_no_token_ids(tokenizer)
         cand_ids = yes_ids + no_ids
@@ -1037,6 +1140,8 @@ def load_split(data_cfg: DatasetConfig, split: str):
     dataset = build_datasets(data_cfg)[split]
     print(f"split {split}: {len(dataset):,} examples "
           f"({len({e.ecg_id for e in dataset.examples}):,} records)")
+    print(f"prompt: strip_think={data_cfg.strip_think} (must match the checkpoint's "
+          "training run)")
     return dataset
 
 
@@ -1083,6 +1188,7 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
           f"do_sample {gen_config.do_sample})"
           + ("  [ZERO-LATENTS CONTROL: the prefix carries nothing]" if zero_latents else ""))
 
+    mismatch = bool(ctx.strip_think_check.get("strip_think_mismatch", False))
     records: List[dict] = []
     n_impure = 0
     n_printed = 0
@@ -1124,6 +1230,8 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
                     "prompt": batch["prompt"][b],
                     "shuffled_embeddings": bool(shuffled),
                     "zero_latents": bool(zero_latents),
+                    # True only under --allow-strip-think-mismatch
+                    "strip_think_mismatch": mismatch,
                     "donor_ecg_id": batch["donor_ecg_id"][b] if shuffled else None,
                     "seed": seed,
                 }
@@ -1177,6 +1285,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
           f"max_length {max_length}"
           + ("  [ZERO-LATENTS CONTROL]" if zero_latents else ""))
 
+    mismatch = bool(ctx.strip_think_check.get("strip_think_mismatch", False))
     records: List[dict] = []
     t0 = time.time()
     for bi, batch in enumerate(loader):
@@ -1199,6 +1308,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                 "position_losses": pos_losses,
                 "shuffled_embeddings": bool(shuffled),
                 "zero_latents": bool(zero_latents),
+                "strip_think_mismatch": mismatch,   # only under the escape hatch
                 "seed": seed,
             })
         if log_every and (bi + 1) % log_every == 0:
@@ -1221,7 +1331,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
 
 
 def build_data_config(args) -> DatasetConfig:
-    cfg_kwargs = {"strip_think": bool(getattr(args, "strip_think", False))}
+    cfg_kwargs = {"strip_think": bool(args.strip_think)}
     if args.emb_cache:
         cfg_kwargs["emb_cache_dir"] = args.emb_cache
     if args.manifest:
@@ -1238,6 +1348,11 @@ def main():
     if args.from_jsonl:
         records = read_jsonl(args.from_jsonl)
         print(f"loaded {len(records):,} records from {args.from_jsonl}")
+        n_mismatch = sum(1 for r in records if r.get("strip_think_mismatch"))
+        if n_mismatch:
+            print(f"WARNING: {n_mismatch:,} of these records were generated under "
+                  "--allow-strip-think-mismatch: the prompt was not the one the "
+                  "checkpoint trained on, and the metrics below inherit that.")
         table = compute_all_metrics(records)
         print_metrics(table)
         out = args.metrics_out or (os.path.splitext(args.from_jsonl)[0] + ".metrics.json")
@@ -1284,7 +1399,9 @@ def main():
 
     # ---- teacher-forced loss: no generation --------------------------------
     if args.teacher_forced_loss:
-        ctx = EvalContext.load(args.model_dir, args.ckpt)
+        ctx = EvalContext.load(
+            args.model_dir, args.ckpt, strip_think=data_cfg.strip_think,
+            allow_strip_think_mismatch=args.allow_strip_think_mismatch)
         records, elapsed = run_teacher_forced(
             ctx, dataset, indices, split=args.split, seed=args.seed,
             shuffled=args.shuffle_embeddings, zero_latents=args.zero_latents,
@@ -1300,7 +1417,7 @@ def main():
                 "split": args.split, "checkpoint": args.ckpt, "model_dir": args.model_dir,
                 "shuffle_embeddings": bool(args.shuffle_embeddings),
                 "zero_latents": bool(args.zero_latents),
-                "strip_think": bool(args.strip_think),
+                "strip_think": bool(args.strip_think), **ctx.strip_think_check,
                 "task_stream": args.task_stream,
                 "seed": args.seed, "limit": args.limit, "batch_size": args.batch_size,
                 "max_length": args.max_length, "losses": args.out,
@@ -1328,7 +1445,9 @@ def main():
         print(f"wrote {metrics_out}")
         return
 
-    ctx = EvalContext.load(args.model_dir, args.ckpt)
+    ctx = EvalContext.load(
+        args.model_dir, args.ckpt, strip_think=data_cfg.strip_think,
+        allow_strip_think_mismatch=args.allow_strip_think_mismatch)
     records, n_impure, elapsed = run_generation(
         ctx, dataset, indices, args.out, split=args.split, seed=args.seed,
         shuffled=args.shuffle_embeddings, zero_latents=args.zero_latents,
@@ -1349,7 +1468,7 @@ def main():
         "model_dir": args.model_dir,
         "shuffle_embeddings": bool(args.shuffle_embeddings),
         "zero_latents": bool(args.zero_latents),
-        "strip_think": bool(args.strip_think),
+        "strip_think": bool(args.strip_think), **ctx.strip_think_check,
         "seed": args.seed,
         "limit": args.limit,
         "max_new_tokens": args.max_new_tokens,

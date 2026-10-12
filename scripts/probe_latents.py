@@ -188,8 +188,15 @@ def parse_args():
     ap.add_argument("--compare-to", default=os.path.join(
         REPO_ROOT, "results", "probe_embeddings.json"),
         help="probe_embeddings.py output to print alongside; '' to skip")
-    ap.add_argument("--strip-think", action="store_true",
-                    help="MUST match the flag the checkpoint trained with")
+    ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
+                    default=DatasetConfig.strip_think,
+                    help="MUST match the flag the checkpoint trained with. ON by "
+                         "default; --no-strip-think for runs 1 and 2")
+    ap.add_argument("--allow-strip-think-mismatch", action="store_true",
+                    help="run even though --strip-think disagrees with the value the "
+                         "checkpoint was trained with. Without this the script "
+                         "refuses; with it, it warns and marks the output, because "
+                         "the student is then scored on a prompt it never trained on")
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--teacher", default=None)
@@ -628,7 +635,9 @@ def main():
         print(f"CONTROLS ACTIVE: {', '.join(controls)} -- every number below is a "
               "null, not a result")
 
-    ctx = EvalContext.load(args.model_dir, args.ckpt)
+    ctx = EvalContext.load(
+        args.model_dir, args.ckpt, strip_think=data_cfg.strip_think,
+        allow_strip_think_mismatch=args.allow_strip_think_mismatch)
     fit_device = (str(ctx.dev) if args.fit_device == "auto" else args.fit_device)
     print(f"fitting on {fit_device} (fp64)")
 
@@ -703,7 +712,7 @@ def main():
             "feature_dim": int(dim),
             "pooling": "mean over the 64 output latents",
             "l2": args.l2, "max_iter": args.max_iter, "seed": args.seed,
-            "strip_think": bool(args.strip_think),
+            "strip_think": bool(args.strip_think), **ctx.strip_think_check,
             "limit_records": args.limit_records,
             "compared_against": args.compare_to if embeddings else None,
             "results": results,

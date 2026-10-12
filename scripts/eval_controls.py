@@ -85,7 +85,7 @@ from evaluate import (  # noqa: E402
     run_teacher_forced,
     summarise_teacher_forced,
 )
-from src.data.dataset import TASK_STREAM_MODES  # noqa: E402
+from src.data.dataset import TASK_STREAM_MODES, DatasetConfig  # noqa: E402
 
 # The three conditions, in the order they are run and reported. Used for both the
 # generation sweep and the teacher-forced sweep, so the two cannot disagree on what
@@ -166,6 +166,16 @@ def parse_args():
                          "the prompt -- so this flag moves the teacher-forced columns "
                          "alone")
     ap.add_argument("--skip-teacher-forced", action="store_true")
+    ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
+                    default=DatasetConfig.strip_think,
+                    help="MUST match what the checkpoint trained with. ON by default; "
+                         "pass --no-strip-think for a checkpoint trained with the "
+                         "template's open <think> block, as runs 1 and 2 were")
+    ap.add_argument("--allow-strip-think-mismatch", action="store_true",
+                    help="run even though --strip-think disagrees with the value the "
+                         "checkpoint was trained with. Without this the script "
+                         "refuses; with it, it warns and marks the output, because "
+                         "the student is then scored on a prompt it never trained on")
     # data path overrides (default to DatasetConfig)
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
@@ -460,7 +470,9 @@ def main():
     keys = [(base.examples[i].ecg_id, base.examples[i].superclass) for i in gen_indices]
     print(f"conditions share {len(set(keys))} distinct (ecg_id, superclass) examples")
 
-    ctx = EvalContext.load(args.model_dir, args.ckpt)
+    ctx = EvalContext.load(
+        args.model_dir, args.ckpt, strip_think=data_cfg.strip_think,
+        allow_strip_think_mismatch=args.allow_strip_think_mismatch)
 
     by_condition = {}
     paths = {}
@@ -536,6 +548,7 @@ def main():
             "seed": args.seed, "limit": args.limit, "tf_limit": args.tf_limit,
             "batch_size": args.batch_size, "max_new_tokens": args.max_new_tokens,
             "task_stream": args.task_stream,
+            "strip_think": bool(args.strip_think), **ctx.strip_think_check,
             "files": paths,
             "conditions": summaries,
             "identical": identical,

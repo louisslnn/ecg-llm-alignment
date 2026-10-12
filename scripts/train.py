@@ -13,7 +13,9 @@ every --ckpt-every steps and at each epoch end. On startup it resumes automatica
 from the latest checkpoint if one exists. Only the last 2 rotating checkpoints plus
 best.pt (lowest val loss) are kept.
 
-    # the gate: can the resampler overfit 50 examples to ~0 loss?
+    # the gate: overfit 50 examples, then show it three ways on those same 50 --
+    # teacher-forced loss, free generation, and the loss at the Yes/No token for
+    # each label separately (scripts/overfit_gate.py). Exits 0 only if all three pass.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50
 
     # full run (auto-resumes)
@@ -29,6 +31,7 @@ import os
 import random
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -51,6 +54,8 @@ from src.model.resampler import (  # noqa: E402
     Resampler,
     mean_embedding_norm,
 )
+from evaluate import require_strip_think_match  # noqa: E402
+from overfit_gate import eval_mean_loss, gate_batches, run_gate  # noqa: E402
 from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
     GradFlowError,
     check_gradients,
@@ -105,11 +110,12 @@ def parse_args():
                          "can read the answer it will not have at inference. Neither "
                          "setting changes what the LLM receives or where the loss "
                          "lands -- only the resampler's second stream")
-    ap.add_argument("--strip-think", action="store_true",
+    ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
+                    default=DatasetConfig.strip_think,
                     help="strip the template's trailing open <think> block from the "
-                         "prompt. OFF by default, matching run 1; evaluation must be "
-                         "given the same flag or the student is scored on a prompt it "
-                         "never saw")
+                         "prompt. ON by default; --no-strip-think keeps the block, as "
+                         "runs 1 and 2 trained. Evaluation must be given the same "
+                         "setting or the student is scored on a prompt it never saw")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--grad-checkpointing", choices=["on", "off"], default="off",
                     help="LLM activation checkpointing; off by default -- the probe "
@@ -123,8 +129,20 @@ def parse_args():
     # the gate
     ap.add_argument("--overfit", type=int, default=None,
                     help="overfit the first N train examples (no val); the pipeline gate")
-    ap.add_argument("--overfit-target-loss", type=float, default=0.05)
+    ap.add_argument("--overfit-target-loss", type=float, default=0.05,
+                    help="stop the overfit loop once the eval-mode mean loss over ALL "
+                         "the overfit examples reaches this -- gate condition 1's own "
+                         "quantity, so it must sit below --gate-threshold. It only "
+                         "decides when training stops; the verdict is the "
+                         "three-condition gate that runs afterwards")
+    ap.add_argument("--overfit-eval-every", type=int, default=50,
+                    help="check that stop rule every N steps (one no-grad pass over "
+                         "the overfit examples each time)")
     ap.add_argument("--overfit-max-steps", type=int, default=3000)
+    ap.add_argument("--gate-threshold", type=float, default=0.1,
+                    help="in --overfit mode, the mean teacher-forced loss over the "
+                         "overfit examples must be below this. One of three gate "
+                         "conditions; see scripts/overfit_gate.py for the other two")
     # data path overrides (default to DatasetConfig)
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
@@ -136,6 +154,14 @@ def parse_args():
     if args.no_output_norm and args.prefix_scale != 1.0:
         ap.error("--prefix-scale has nothing to calibrate with --no-output-norm; "
                  f"drop one of the two (got --prefix-scale {args.prefix_scale:g})")
+    # The loop stops on the number condition 1 then re-measures. A stop target at or
+    # above the gate's threshold would stop a run the gate is bound to fail.
+    if args.overfit is not None and args.overfit_target_loss >= args.gate_threshold:
+        ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be below "
+                 f"--gate-threshold ({args.gate_threshold:g}): the loop stops on the "
+                 "same quantity the gate's first condition checks")
+    if args.overfit_eval_every < 1:
+        ap.error("--overfit-eval-every must be at least 1")
     return args
 
 
@@ -155,6 +181,43 @@ _PREEMPT = {"flag": False}
 # yields checkpoints whose weights differ only through one scalar; without this there
 # is nothing in the file that says which run produced it.
 _RUN_META: dict = {}
+
+
+def git_state():
+    """``(head, dirty, lines)``: the commit this code is at and how the tree differs.
+
+    ``dirty`` means tracked files differ from HEAD. Untracked paths are listed but do
+    not make the tree dirty on their own, or a logs/ directory would mark every run;
+    read the list, since an untracked module this script imports is still code that
+    no commit records. ``head`` is None when git cannot answer.
+    """
+    def git(*cmd):
+        return subprocess.run(["git", "-C", REPO_ROOT, *cmd], capture_output=True,
+                              text=True, check=True).stdout
+
+    try:
+        head = git("rev-parse", "HEAD").strip()
+        lines = git("status", "--porcelain").splitlines()
+    except (OSError, subprocess.CalledProcessError) as err:
+        return None, None, [f"git unavailable: {err}"]
+    return head, any(not line.startswith("??") for line in lines), lines
+
+
+def log_git_state():
+    head, dirty, lines = git_state()
+    if head is None:
+        print(f"git HEAD unknown ({lines[0]})")
+    else:
+        n_untracked = sum(line.startswith("??") for line in lines)
+        state = (f"DIRTY: {len(lines) - n_untracked} tracked file(s) differ from HEAD"
+                 if dirty else "clean")
+        if n_untracked:
+            state += f", {n_untracked} untracked path(s)"
+        print(f"git HEAD {head}  working tree {state}")
+        for line in lines:
+            print(f"    {line}")
+    sys.stdout.flush()
+    _RUN_META.update({"git_head": head, "git_dirty": dirty})
 
 
 def _install_signal_handlers():
@@ -334,9 +397,24 @@ def prefix_scale_line(model, resampler, batch, dev, task_stream: str = "prompt")
             + gain)
 
 
-def train_overfit(model, resampler, optimizer, loader, dev, args):
-    print(f"gate: overfit to loss <= {args.overfit_target_loss} within "
-          f"{args.overfit_max_steps} steps")
+def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
+    """Train until the overfit set's eval-mode mean loss reaches the target, or the cap.
+
+    The stop rule is gate condition 1's own quantity (overfit_gate.eval_mean_loss
+    over ``eval_batches``, every --overfit-eval-every steps), not the loss of the
+    batch just trained on: one easy batch in train mode says little about the mean
+    over all of them in eval mode, and a loop that stops on the former can fail the
+    gate the moment it stops.
+
+    Reaching the target is still NOT the gate: run 1 reached 0.0496 and its free
+    generation was degenerate. The caller runs the gate on the result either way, so
+    a run that stops at the cap still reports all three conditions.
+    """
+    n_examples = sum(len(b["ecg_id"]) for b in eval_batches)
+    print(f"overfit: train until the eval-mode mean loss over all {n_examples} "
+          f"examples is <= {args.overfit_target_loss} (checked every "
+          f"{args.overfit_eval_every} steps), at most {args.overfit_max_steps} steps; "
+          "then run the gate")
     resampler.train()
     step = 0
     checked = False
@@ -360,12 +438,20 @@ def train_overfit(model, resampler, optimizer, loader, dev, args):
                 print(f"    prefix scale @ step {step}: "
                       f"{prefix_scale_line(model, resampler, batch, dev, args.task_stream)}",
                       flush=True)
-            if lv <= args.overfit_target_loss:
-                print(f"GATE PASSED: loss {lv:.4f} <= {args.overfit_target_loss} at step {step}")
-                return True
+            if step % args.overfit_eval_every == 0:
+                mean = eval_mean_loss(model, resampler, eval_batches, dev,
+                                      args.task_stream)
+                print(f"    eval-mode mean over all {n_examples} examples @ step "
+                      f"{step}: {mean:.4f}  (stop at <= {args.overfit_target_loss})",
+                      flush=True)
+                if mean <= args.overfit_target_loss:
+                    print(f"overfit stopped: eval-mode mean {mean:.4f} <= "
+                          f"{args.overfit_target_loss} at step {step}")
+                    return True
             if step >= args.overfit_max_steps:
                 break
-    print(f"GATE NOT MET: did not reach {args.overfit_target_loss} in {step} steps")
+    print(f"overfit stopped: eval-mode mean did NOT reach {args.overfit_target_loss} "
+          f"in {step} steps; the gate runs regardless")
     return False
 
 
@@ -419,6 +505,7 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
 
 def main():
     args = parse_args()
+    log_git_state()                           # first line of the log: what code ran
     if args.lr is None:                       # 1e-4 in the gate, 1e-5 for real training
         args.lr = 1e-4 if args.overfit is not None else 1e-5
     _RUN_META.update({
@@ -444,8 +531,15 @@ def main():
     if args.teacher:
         cfg_kwargs["teacher_path"] = args.teacher
     data_cfg = DatasetConfig(**cfg_kwargs)
+    print(f"prompt: strip_think={data_cfg.strip_think}")
 
     preflight(args, data_cfg)
+    # A resume continues the checkpoint's run, so it has to continue it on the same
+    # prompt. Checked here, before the student loads; there is no way through, since
+    # switching prompt format mid-run is not an experiment anyone can read.
+    if args.overfit is None and _rotating(args.ckpt_dir):
+        require_strip_think_match(_rotating(args.ckpt_dir)[-1], args.strip_think,
+                                  escape_flag=None)
 
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; training needs GPUs")
@@ -498,7 +592,16 @@ def main():
           f"grad_checkpointing={args.grad_checkpointing}")
 
     if args.overfit is not None:
-        ok = train_overfit(model, resampler, optimizer, train_loader, dev, args)
+        # The stop rule and the gate both read the overfit examples back in dataset
+        # order, through the same batches.
+        overfit_set = train_loader.dataset          # the Subset build_loaders made
+        dataset, indices = overfit_set.dataset, list(overfit_set.indices)
+        train_overfit(model, resampler, optimizer, train_loader,
+                      gate_batches(tokenizer, dataset, indices, args), dev, args)
+        # Drop the last step's gradients first: nothing below needs them.
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        ok = run_gate(model, resampler, tokenizer, dataset, indices, args)
         sys.exit(0 if ok else 1)
 
     start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer, dev)
