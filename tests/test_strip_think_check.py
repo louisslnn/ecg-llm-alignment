@@ -88,6 +88,8 @@ def test_overfit_final_reads_back_like_any_training_checkpoint(tmp_path, monkeyp
                                       "--no-strip-think"])
     args = train.parse_args()
     monkeypatch.setitem(train._RUN_META, "strip_think", bool(args.strip_think))
+    selection = {"select": "head", "ecg_ids": [1, 2], "label_counts": {}}
+    monkeypatch.setitem(train._RUN_META, "overfit_selection", selection)
 
     module = torch.nn.Linear(2, 2)
     reference = torch.load(
@@ -109,9 +111,12 @@ def test_overfit_final_reads_back_like_any_training_checkpoint(tmp_path, monkeyp
             assert torch.equal(loaded.state_dict()[key], value)
 
         payload = torch.load(path, weights_only=False)
-        assert set(payload) == (set(reference) - {"optimizer"}) | {"gate_passed", "args"}
+        assert set(payload) == (set(reference) - {"optimizer"}) | {
+            "gate_passed", "args", "overfit_selection"}
         assert payload["gate_passed"] is passed
         assert payload["args"] == vars(args)
+        # which examples the verdict is about: beside it, and in the meta
+        assert payload["overfit_selection"] == selection == payload["meta"]["overfit_selection"]
 
 
 @pytest.mark.parametrize("meta", ["absent", {}, {"prefix_scale": 1.0}, None])
@@ -213,3 +218,10 @@ def test_every_script_that_loads_a_checkpoint_goes_through_the_check():
         if name.endswith(".py") and name != "evaluate.py":
             source = open(os.path.join(scripts, name), encoding="utf-8").read()
             assert "load_resampler(" not in source, f"{name} bypasses EvalContext.load"
+    # latent_spread.py reads a checkpoint without the student, so it has no
+    # EvalContext to go through. It builds prompts all the same, so it makes the
+    # check itself, with the strip_think the checkpoint's run recorded, and offers
+    # no way past it.
+    source = open(os.path.join(scripts, "latent_spread.py"), encoding="utf-8").read()
+    assert ('require_strip_think_match(args.ckpt, run["strip_think"], escape_flag=None)'
+            in source)

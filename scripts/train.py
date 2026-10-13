@@ -20,6 +20,22 @@ best.pt (lowest val loss) are kept.
     # overfit_final.pt (~3.4 GB), so it can be probed without retraining it.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50
 
+    # the same gate with the loss on ONE position per example, the Yes/No token
+    # after "Conclusion:" (--loss-on decision; the default, all, is the whole
+    # target). Prompt, prefix, task stream and tokenisation are identical; only
+    # which target positions contribute changes. Every loss this mode logs is the
+    # decision-token mean and is labelled so, the stop rule measures that token per
+    # label, the gate is judged on condition 3 alone, and the real/shuffled/zeroed
+    # controls are reported at that token, split by label. Give it its own
+    # --ckpt-dir: it writes the same file names as any other gate run.
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --loss-on decision
+
+    # the same gate on records drawn so that every superclass has at least three
+    # Yes and three No among them (--overfit-select stratified; the default, head,
+    # is the first N train examples). On the head set the answer can be read off
+    # the question alone; see stratified_records for the rule that draws these.
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --overfit-select stratified
+
     # full run (auto-resumes)
     python scripts/train.py --model-dir $MODEL_DIR --ckpt-dir $SCRATCH/ecg/ckpt
 
@@ -56,8 +72,15 @@ from src.model.resampler import (  # noqa: E402
     Resampler,
     mean_embedding_norm,
 )
+from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 from evaluate import require_strip_think_match  # noqa: E402
-from overfit_gate import eval_mean_loss, gate_batches, run_gate  # noqa: E402
+from overfit_gate import (  # noqa: E402
+    GATE_DECISION_LOSS,
+    eval_decision_loss,
+    eval_mean_loss,
+    gate_batches,
+    run_gate,
+)
 from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
     GradFlowError,
     check_gradients,
@@ -66,8 +89,15 @@ from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
     load_student,
     splice_forward,
 )
+from yn_token_loss import MARKER, decision_index, tokenise_target  # noqa: E402
 
 GiB = 1024 ** 3
+
+LOSS_ON_MODES = ("all", "decision")
+OVERFIT_SELECT_MODES = ("head", "stratified")
+# --overfit-select stratified: every superclass has at least this many Yes and this
+# many No among the chosen records. The gate's definition, changed here, not per run.
+STRATIFIED_MIN_PER_ANSWER = 3
 
 
 def parse_args():
@@ -112,6 +142,15 @@ def parse_args():
                          "can read the answer it will not have at inference. Neither "
                          "setting changes what the LLM receives or where the loss "
                          "lands -- only the resampler's second stream")
+    ap.add_argument("--loss-on", choices=LOSS_ON_MODES, default="all",
+                    help="which target positions the loss is computed on. 'all' "
+                         "(default) is every target token. 'decision' is exactly one "
+                         "per example: the Yes/No token after \"Conclusion:\". "
+                         "Nothing else differs -- same prompt, prefix, task stream, "
+                         "tokenisation and -100 masking of prompt and padding. An "
+                         "example whose decision token cannot be placed is fatal, "
+                         "never skipped. Every loss logged under 'decision' is the "
+                         "decision-token mean and is labelled so")
     ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
                     default=DatasetConfig.strip_think,
                     help="strip the template's trailing open <think> block from the "
@@ -130,13 +169,27 @@ def parse_args():
     ap.add_argument("--ckpt-every", type=int, default=1000)
     # the gate
     ap.add_argument("--overfit", type=int, default=None,
-                    help="overfit the first N train examples (no val); the pipeline gate")
+                    help="overfit N train examples (no val); the pipeline gate. Which N "
+                         "is --overfit-select")
+    ap.add_argument("--overfit-select", choices=OVERFIT_SELECT_MODES, default="head",
+                    help="which examples --overfit N takes. 'head' (default) is the "
+                         "first N of the train split, as every gate run before this "
+                         "flag. 'stratified' is N/5 whole records drawn, by a seeded "
+                         "rule (--seed), so that each superclass has at least "
+                         f"{STRATIFIED_MIN_PER_ANSWER} Yes and {STRATIFIED_MIN_PER_ANSWER} "
+                         "No among them: on a set where every record has the same "
+                         "five answers, the decision is a function of the question and "
+                         "the gate can pass without the ECG being read")
     ap.add_argument("--overfit-target-loss", type=float, default=0.05,
                     help="stop the overfit loop once the eval-mode mean loss over ALL "
                          "the overfit examples reaches this -- gate condition 1's own "
                          "quantity, so it must sit below --gate-threshold. It only "
                          "decides when training stops; the verdict is the "
-                         "three-condition gate that runs afterwards")
+                         "three-condition gate that runs afterwards. Under --loss-on "
+                         "decision it is the eval-mode DECISION-TOKEN mean that must "
+                         "reach this, on label=True and label=False separately -- "
+                         "condition 3's quantity, whose threshold is fixed at "
+                         f"{GATE_DECISION_LOSS:g}")
     ap.add_argument("--overfit-eval-every", type=int, default=50,
                     help="check that stop rule every N steps (one no-grad pass over "
                          "the overfit examples each time)")
@@ -144,7 +197,9 @@ def parse_args():
     ap.add_argument("--gate-threshold", type=float, default=0.1,
                     help="in --overfit mode, the mean teacher-forced loss over the "
                          "overfit examples must be below this. One of three gate "
-                         "conditions; see scripts/overfit_gate.py for the other two")
+                         "conditions; see scripts/overfit_gate.py for the other two. "
+                         "Under --loss-on decision this condition is printed against "
+                         "the threshold but not judged")
     # data path overrides (default to DatasetConfig)
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
@@ -158,12 +213,31 @@ def parse_args():
                  f"drop one of the two (got --prefix-scale {args.prefix_scale:g})")
     # The loop stops on the number condition 1 then re-measures. A stop target at or
     # above the gate's threshold would stop a run the gate is bound to fail.
-    if args.overfit is not None and args.overfit_target_loss >= args.gate_threshold:
+    # Under --loss-on decision the loop stops on condition 3's number instead, and
+    # the same holds against that condition's threshold.
+    if args.overfit is not None and args.loss_on == "decision":
+        if args.overfit_target_loss >= GATE_DECISION_LOSS:
+            ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be "
+                     f"below the gate's decision-token threshold "
+                     f"({GATE_DECISION_LOSS:g}): under --loss-on decision the loop "
+                     "stops on the same quantity the gate's third condition checks")
+    elif args.overfit is not None and args.overfit_target_loss >= args.gate_threshold:
         ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be below "
                  f"--gate-threshold ({args.gate_threshold:g}): the loop stops on the "
                  "same quantity the gate's first condition checks")
     if args.overfit_eval_every < 1:
         ap.error("--overfit-eval-every must be at least 1")
+    if args.overfit_select == "stratified":
+        # The unit is a record with its five questions, and three Yes plus three No
+        # for one superclass already takes six records.
+        min_n = 2 * STRATIFIED_MIN_PER_ANSWER * len(SUPERCLASSES)
+        if args.overfit is None:
+            ap.error("--overfit-select stratified selects the --overfit examples; "
+                     "without --overfit N it would be silently ignored")
+        if args.overfit % len(SUPERCLASSES) or args.overfit < min_n:
+            ap.error(f"--overfit-select stratified needs --overfit to be a whole "
+                     f"number of records times {len(SUPERCLASSES)} questions, and at "
+                     f"least {min_n} (got --overfit {args.overfit})")
     return args
 
 
@@ -304,7 +378,9 @@ def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
     the gate did not. The payload is a training checkpoint's -- the same keys, the
     same meta with strip_think -- so evaluate.load_resampler and
     evaluate.checkpoint_strip_think read it as they read any other, plus the gate's
-    verdict and the run's full arguments. It has no optimizer state: nothing resumes
+    verdict, the run's full arguments and the examples the verdict is about
+    (``overfit_selection``, the meta's entry from select_overfit: mode, ecg_ids,
+    Yes/No counts per superclass). It has no optimizer state: nothing resumes
     from it (resume() only looks at ckpt_step*.pt), and AdamW's two moments would
     triple the ~3.4 GB the fp32 weights take. best_val_loss is inf, as in any
     checkpoint written before a validation pass: --overfit has no validation.
@@ -312,13 +388,14 @@ def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
     payload = _payload(resampler, epoch, step, float("inf"))
     payload["gate_passed"] = bool(gate_passed)
     payload["args"] = dict(vars(args))
+    payload["overfit_selection"] = payload["meta"].get("overfit_selection")
     path = os.path.join(ckpt_dir, OVERFIT_FINAL)
     torch.save(payload, path + ".tmp")
     os.replace(path + ".tmp", path)          # atomic
     return path
 
 
-def resume(ckpt_dir, resampler, optimizer, dev):
+def resume(ckpt_dir, resampler, optimizer, dev, loss_on="all"):
     ckpts = _rotating(ckpt_dir)
     if not ckpts:
         print("no checkpoint found; starting fresh")
@@ -327,6 +404,14 @@ def resume(ckpt_dir, resampler, optimizer, dev):
     # our own checkpoint (trusted); it carries numpy/python RNG state that the
     # weights_only=True default (torch>=2.6) refuses to unpickle.
     payload = torch.load(path, map_location=dev, weights_only=False)
+    # A checkpoint with no entry predates --loss-on and trained on the whole target.
+    trained_on = (payload.get("meta") or {}).get("loss_on", "all")
+    if trained_on != loss_on:
+        sys.exit(f"loss-on MISMATCH: {path} was trained with --loss-on {trained_on}, "
+                 f"this run has --loss-on {loss_on}. Resuming would continue one "
+                 "objective under another, against a best_val_loss that is a "
+                 f"different quantity. Pass --loss-on {trained_on}, or a fresh "
+                 "--ckpt-dir.")
     resampler.load_state_dict(payload["resampler"])
     optimizer.load_state_dict(payload["optimizer"])
     rng = payload.get("rng")
@@ -347,19 +432,191 @@ def resume(ckpt_dir, resampler, optimizer, dev):
 # Data                                                                        #
 # --------------------------------------------------------------------------- #
 
+class DecisionTokenError(RuntimeError):
+    """--loss-on decision could not place its one supervised position for an example."""
+
+
+def make_decision_collate(tokenizer, collate):
+    """``collate``, plus ``decision_mask``: the one position --loss-on decision trains on.
+
+    Wraps training's collate and leaves every tensor it produced as it was. In
+    particular ``labels`` still carries the whole target: prompt_only_task_mask reads
+    the prompt off ``labels == -100``, so narrowing labels here would move the
+    target into the resampler's task stream. The narrowing happens in
+    probe_memory.splice_forward, after that mask is taken; this only says where.
+
+    ``decision_mask`` is bool, shaped like ``labels``, with exactly one True per row:
+    the Yes/No token after "Conclusion:", found with yn_token_loss's locator on the
+    target rebuilt by tokenise_target -- the pair the gate's condition 3 uses, and
+    the same guard. The rebuilt target must be the supervised span token for token
+    (so a target --max-length cut short fails here, where --loss-on all would train
+    on what was left), and the decision token must be locatable. Either failure
+    raises DecisionTokenError naming the examples. Nothing is skipped: with one
+    position per example, dropping an example changes what the loss is a mean of.
+    """
+    def decision_collate(batch):
+        out = collate(batch)
+        labels = out["labels"]
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        problems = []
+        for i, b in enumerate(batch):
+            span = (labels[i] != -100).nonzero().flatten()   # the supervised positions
+            ids, offsets = tokenise_target(tokenizer, b["target"])
+            k, why = decision_index(b["target"], offsets)
+            if len(ids) != len(span):
+                why = (f"rebuilt target has {len(ids)} tokens, the supervised span "
+                       f"{len(span)}"
+                       + (" (cut short by --max-length)" if len(span) < len(ids) else ""))
+            elif labels[i][span].tolist() != ids:
+                why = "rebuilt target has the supervised span's length but not its tokens"
+            if why:
+                problems.append(f"  {b['ecg_id']:>7} {b['superclass']:<6} {why}")
+                continue
+            mask[i, span[k]] = True
+        if problems:
+            raise DecisionTokenError(
+                f"the token after {MARKER!r} cannot be placed for {len(problems)} of "
+                f"the {len(batch)} examples in a batch:\n" + "\n".join(problems)
+                + "\nNothing was skipped: the loss is one position per example, so an "
+                "example left out makes it a mean over different examples.")
+        out["decision_mask"] = mask
+        return out
+
+    return decision_collate
+
+
+def label_counts(examples):
+    """superclass -> {"yes": n, "no": n} over ``examples``, in SUPERCLASSES order."""
+    counts = {sc: {"yes": 0, "no": 0} for sc in SUPERCLASSES}
+    for e in examples:
+        counts[e.superclass]["yes" if e.label else "no"] += 1
+    return counts
+
+
+def stratified_records(examples, n_records, seed):
+    """--overfit-select stratified: ``n_records`` ecg_ids, in the order drawn.
+
+    Every superclass ends with at least STRATIFIED_MIN_PER_ANSWER Yes and as many No
+    among the chosen records. THE RULE, which is all there is to it:
+
+      1. The candidates are the records in ``examples`` that have all five questions
+         (a record the dataset dropped a block from is not a whole unit), in
+         ascending ecg_id.
+      2. They are shuffled once, by ``random.Random(seed)`` -- its own generator, so
+         the streams training draws from are where --overfit-select head leaves them.
+      3. ``n_records`` times: a record's score is how many of its five answers are
+         one some superclass is still short of. Take the highest score; among equal
+         scores, the record earliest in the shuffled order.
+      4. If any superclass is still short when the records run out, raise. Nothing is
+         relaxed: a set that does not meet the floor is not this selection.
+
+    Nothing is searched and nothing is scored against the model, so the same examples
+    and seed give the same records. Once no answer is short every score is zero and
+    step 3 is simply the next record in the shuffled order.
+
+    What it favours, on purpose: at ten records the floor asks for fifteen Yes, so
+    step 3 reaches for records positive for several superclasses at once. The set is
+    balanced, NOT representative -- the Yes/No table printed at startup is what it
+    is, and the train split's rates are not.
+
+    Pure on the examples; raises ValueError when the floor cannot be met.
+    """
+    answers = {}
+    for e in examples:
+        answers.setdefault(int(e.ecg_id), {})[e.superclass] = bool(e.label)
+    order = sorted(r for r, a in answers.items() if len(a) == len(SUPERCLASSES))
+    if len(order) < n_records:
+        raise ValueError(f"{n_records} records asked for, {len(order)} have all "
+                         f"{len(SUPERCLASSES)} questions")
+    random.Random(seed).shuffle(order)
+
+    short = {(sc, answer): STRATIFIED_MIN_PER_ANSWER
+             for sc in SUPERCLASSES for answer in (True, False)}
+    chosen = []
+    while len(chosen) < n_records:
+        if not any(n > 0 for n in short.values()):
+            chosen += order[:n_records - len(chosen)]
+            break
+        # max() keeps the first of equal scores: the earliest in the shuffled order
+        best = max(order, key=lambda r: sum(short[cell] > 0
+                                            for cell in answers[r].items()))
+        order.remove(best)
+        chosen.append(best)
+        for cell in answers[best].items():
+            short[cell] -= 1
+    missing = [f"{sc} {'Yes' if answer else 'No'} has {STRATIFIED_MIN_PER_ANSWER - n}"
+               for (sc, answer), n in short.items() if n > 0]
+    if missing:
+        raise ValueError(
+            f"{n_records} records did not give every superclass "
+            f"{STRATIFIED_MIN_PER_ANSWER} Yes and {STRATIFIED_MIN_PER_ANSWER} No under "
+            f"this rule with seed {seed}: {', '.join(missing)}. Raise --overfit; the "
+            "rule is not relaxed to fit")
+    return chosen
+
+
+def select_overfit(dataset, args):
+    """``(indices, selection)``: the examples --overfit trains on, and their record.
+
+    ``head`` is the first N examples of the split, exactly as before the flag
+    existed. ``stratified`` is every example of the records
+    :func:`stratified_records` draws. Either way the indices are ascending, so the
+    stop rule and the gate still read the examples back in dataset order.
+
+    ``selection`` is what the run has to say about its draw: the mode, the ecg_ids in
+    dataset order and the Yes/No counts per superclass. It is printed at startup and
+    goes into every checkpoint's meta and overfit_final.pt's payload.
+    """
+    examples = dataset.examples
+    if args.overfit_select == "stratified":
+        chosen = set(stratified_records(examples, args.overfit // len(SUPERCLASSES),
+                                        args.seed))
+        indices = [i for i, e in enumerate(examples) if int(e.ecg_id) in chosen]
+    else:
+        indices = list(range(min(args.overfit, len(examples))))
+    picked = [examples[i] for i in indices]
+    return indices, {
+        "select": args.overfit_select,
+        "ecg_ids": list(dict.fromkeys(int(e.ecg_id) for e in picked)),
+        "label_counts": label_counts(picked),
+    }
+
+
+def print_overfit_selection(selection, n_examples, seed):
+    """The draw, said at startup: the ecg_ids and the five by two Yes/No table."""
+    how = (f"stratified, seed {seed}" if selection["select"] == "stratified"
+           else "head, the first examples of the train split")
+    ids = selection["ecg_ids"]
+    print(f"overfit selection: {how} -- {n_examples} examples from {len(ids)} records")
+    print("  ecg_ids: " + " ".join(str(i) for i in ids))
+    print(f"  {'superclass':<12} {'Yes':>5} {'No':>5}")
+    for sc, n in selection["label_counts"].items():
+        print(f"  {sc:<12} {n['yes']:>5} {n['no']:>5}")
+    sys.stdout.flush()
+
+
 def build_loaders(args, tokenizer, data_cfg):
     from torch.utils.data import DataLoader, Subset
 
     splits = build_datasets(data_cfg)
     collate = make_collate_fn(tokenizer, max_length=args.max_length,
                               strip_think=data_cfg.strip_think)
+    if args.loss_on == "decision":
+        collate = make_decision_collate(tokenizer, collate)
     g = torch.Generator()
     g.manual_seed(args.seed)
 
     if args.overfit is not None:
-        n = min(args.overfit, len(splits["train"]))
-        train = Subset(splits["train"], list(range(n)))
-        print(f"OVERFIT mode: {n} train examples, no validation")
+        try:
+            indices, selection = select_overfit(splits["train"], args)
+        except ValueError as err:
+            sys.exit(f"--overfit-select {args.overfit_select}, FATAL: {err}")
+        # A gate whose verdict depends on which examples it drew has to say which
+        # ones: into the meta every checkpoint of this run carries.
+        _RUN_META["overfit_selection"] = selection
+        train = Subset(splits["train"], indices)
+        print(f"OVERFIT mode: {len(indices)} train examples, no validation")
+        print_overfit_selection(selection, len(indices), args.seed)
         train_loader = DataLoader(train, batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.num_workers, collate_fn=collate,
                                   generator=g, drop_last=False)
@@ -379,12 +636,14 @@ def build_loaders(args, tokenizer, data_cfg):
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def validate(model, resampler, val_loader, dev, task_stream: str = "prompt"):
+def validate(model, resampler, val_loader, dev, task_stream: str = "prompt",
+             loss_on: str = "all"):
     resampler.eval()
     losses = []
     for batch in val_loader:
         losses.append(float(splice_forward(model, resampler, batch, dev,
-                                           task_stream=task_stream).detach()))
+                                           task_stream=task_stream,
+                                           loss_on=loss_on).detach()))
     resampler.train()
     return sum(losses) / max(len(losses), 1)
 
@@ -440,13 +699,32 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
     generation was degenerate. The caller runs the gate on the result either way, so
     a run that stops at the cap still reports all three conditions.
 
+    Under --loss-on decision the same holds one condition over. The step loss is the
+    decision-token mean of the batch, and the stop rule is condition 3's quantity
+    (overfit_gate.eval_decision_loss): the eval-mode decision-token mean, which has
+    to reach the target on label=True and on label=False separately, because that is
+    how the gate judges it. A mean over both would stop a constant-Yes resampler on
+    a set where positives dominate, for the gate to fail it at once. Both lines are
+    labelled decision-token, so neither can be read against a --loss-on all log.
+
     Returns the number of steps taken.
     """
+    decision = args.loss_on == "decision"
+    loss_name = "decision-token loss" if decision else "loss"
+    stop_name = ("eval-mode decision-token mean, worse label" if decision
+                 else "eval-mode mean")
     n_examples = sum(len(b["ecg_id"]) for b in eval_batches)
-    print(f"overfit: train until the eval-mode mean loss over all {n_examples} "
-          f"examples is <= {args.overfit_target_loss} (checked every "
-          f"{args.overfit_eval_every} steps), at most {args.overfit_max_steps} steps; "
-          "then run the gate")
+    if decision:
+        print(f"overfit [--loss-on decision]: train until the eval-mode "
+              f"DECISION-TOKEN mean over all {n_examples} examples is <= "
+              f"{args.overfit_target_loss} on label=True and on label=False "
+              f"separately (checked every {args.overfit_eval_every} steps), at most "
+              f"{args.overfit_max_steps} steps; then run the gate")
+    else:
+        print(f"overfit: train until the eval-mode mean loss over all {n_examples} "
+              f"examples is <= {args.overfit_target_loss} (checked every "
+              f"{args.overfit_eval_every} steps), at most {args.overfit_max_steps} "
+              "steps; then run the gate")
     resampler.train()
     step = 0
     checked = False
@@ -454,7 +732,7 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
         for batch in loader:
             t0 = time.time()
             loss = splice_forward(model, resampler, batch, dev,
-                                  task_stream=args.task_stream)
+                                  task_stream=args.task_stream, loss_on=args.loss_on)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if not checked:                       # one-time grad-flow gate
@@ -464,31 +742,51 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
             optimizer.step()
             step += 1
             lv = float(loss.detach())
-            print(f"step {step:5d}  loss {lv:.4f}  {time.time()-t0:.2f}s  {_log_mem()}",
-                  flush=True)
+            print(f"step {step:5d}  {loss_name} {lv:.4f}  {time.time()-t0:.2f}s  "
+                  f"{_log_mem()}", flush=True)
             if step == 1 or step % args.prefix_log_every == 0:
                 print(f"    prefix scale @ step {step}: "
                       f"{prefix_scale_line(model, resampler, batch, dev, args.task_stream)}",
                       flush=True)
             if step % args.overfit_eval_every == 0:
-                mean = eval_mean_loss(model, resampler, eval_batches, dev,
-                                      args.task_stream)
-                print(f"    eval-mode mean over all {n_examples} examples @ step "
-                      f"{step}: {mean:.4f}  (stop at <= {args.overfit_target_loss})",
-                      flush=True)
+                if decision:
+                    dec = eval_decision_loss(model, resampler, eval_batches, dev,
+                                             args.task_stream)
+                    by_label = "  ".join(
+                        f"label={label} " + ("no examples" if dec[label] is None
+                                             else f"{dec[label]:.4f}")
+                        for label in (True, False))
+                    # A label with no examples cannot hold the loop open; the gate
+                    # fails condition 3 on it whatever the other label reaches.
+                    mean = max(v for v in (dec[True], dec[False]) if v is not None)
+                    print(f"    eval-mode decision-token mean over all {n_examples} "
+                          f"examples @ step {step}: {dec['all']:.4f}  {by_label}  "
+                          f"(stop when each label is <= {args.overfit_target_loss})",
+                          flush=True)
+                else:
+                    mean = eval_mean_loss(model, resampler, eval_batches, dev,
+                                          args.task_stream)
+                    print(f"    eval-mode mean over all {n_examples} examples @ step "
+                          f"{step}: {mean:.4f}  (stop at <= {args.overfit_target_loss})",
+                          flush=True)
                 if mean <= args.overfit_target_loss:
-                    print(f"overfit stopped: eval-mode mean {mean:.4f} <= "
+                    print(f"overfit stopped: {stop_name} {mean:.4f} <= "
                           f"{args.overfit_target_loss} at step {step}")
                     return step
             if step >= args.overfit_max_steps:
                 break
-    print(f"overfit stopped: eval-mode mean did NOT reach {args.overfit_target_loss} "
+    print(f"overfit stopped: {stop_name} did NOT reach {args.overfit_target_loss} "
           f"in {step} steps; the gate runs regardless")
     return step
 
 
 def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
           start_epoch, global_step, best_val):
+    # Under --loss-on decision every loss here is the decision-token mean, and each
+    # line says so: it starts near 0.5 where the whole-target loss starts near 3.
+    decision = args.loss_on == "decision"
+    loss_name = "decision-token loss" if decision else "loss"
+    tag = "decision_token_" if decision else ""
     for epoch in range(start_epoch, args.epochs):
         resampler.train()
         gpu_reset()
@@ -496,7 +794,7 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
         running = []
         for batch in train_loader:
             loss = splice_forward(model, resampler, batch, dev,
-                                  task_stream=args.task_stream)
+                                  task_stream=args.task_stream, loss_on=args.loss_on)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if global_step == 0:                  # one-time grad-flow gate
@@ -508,7 +806,7 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
 
             if global_step % args.log_every == 0:
                 dt = (time.time() - window_t0) / args.log_every
-                print(f"epoch {epoch} step {global_step} loss "
+                print(f"epoch {epoch} step {global_step} {loss_name} "
                       f"{sum(running[-args.log_every:]) / args.log_every:.4f} "
                       f"{dt*1000:.0f}ms/step  {_log_mem()}", flush=True)
                 gpu_reset()
@@ -525,11 +823,12 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
                                 best_val, is_best=False)
                 sys.exit(0)
 
-        val_loss = validate(model, resampler, val_loader, dev, args.task_stream)
+        val_loss = validate(model, resampler, val_loader, dev, args.task_stream,
+                            args.loss_on)
         is_best = val_loss < best_val
         best_val = min(best_val, val_loss)
-        print(f"== epoch {epoch} done  train_loss "
-              f"{sum(running)/max(len(running),1):.4f}  val_loss {val_loss:.4f}"
+        print(f"== epoch {epoch} done  train_{tag}loss "
+              f"{sum(running)/max(len(running),1):.4f}  val_{tag}loss {val_loss:.4f}"
               f"{'  (best)' if is_best else ''}", flush=True)
         save_checkpoint(args.ckpt_dir, resampler, optimizer, epoch + 1, global_step,
                         best_val, is_best=is_best)
@@ -543,6 +842,7 @@ def main():
     _RUN_META.update({
         "prefix_scale": args.prefix_scale,
         "task_stream": args.task_stream,
+        "loss_on": args.loss_on,
         "input_layer_norm": not args.no_input_norm,
         "final_output_norm": not args.no_output_norm,
         "strip_think": bool(args.strip_think),
@@ -564,6 +864,11 @@ def main():
         cfg_kwargs["teacher_path"] = args.teacher
     data_cfg = DatasetConfig(**cfg_kwargs)
     print(f"prompt: strip_think={data_cfg.strip_think}")
+    if args.loss_on == "decision":
+        print(f"loss on: decision -- ONE target position per example, the Yes/No token "
+              f"after {MARKER!r}. Every training, stop-rule and validation loss this "
+              "run logs is the mean of that token's loss and is labelled "
+              "decision-token; none of them is comparable with a --loss-on all log.")
 
     preflight(args, data_cfg)
     # A resume continues the checkpoint's run, so it has to continue it on the same
@@ -628,8 +933,13 @@ def main():
         # order, through the same batches.
         overfit_set = train_loader.dataset          # the Subset build_loaders made
         dataset, indices = overfit_set.dataset, list(overfit_set.indices)
+        # The loader's own collate, so under --loss-on decision these batches carry
+        # the mask the training loss uses -- and every overfit example has had its
+        # decision token placed, or the run has stopped, before the first step.
         steps = train_overfit(model, resampler, optimizer, train_loader,
-                              gate_batches(tokenizer, dataset, indices, args), dev, args)
+                              gate_batches(tokenizer, dataset, indices, args,
+                                           collate=train_loader.collate_fn),
+                              dev, args)
         # Drop the last step's gradients first: nothing below needs them.
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
@@ -650,10 +960,14 @@ def main():
                   flush=True)
         sys.exit(0 if ok else 1)
 
-    start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer, dev)
+    start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer,
+                                                dev, args.loss_on)
     train(model, resampler, optimizer, train_loader, val_loader, dev, args,
           start_epoch, global_step, best_val)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DecisionTokenError as err:
+        sys.exit(f"--loss-on decision, FATAL: {err}")

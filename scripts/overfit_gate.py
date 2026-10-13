@@ -52,6 +52,18 @@ The shuffle is a derangement over the overfit set's OWN records, not over the tr
 split: every donor is an ECG the resampler was trained on, so the real-vs-shuffled
 gap is about getting the right record and not about seeing an unfamiliar one. The
 donor is written into every shuffled record as ``donor_ecg_id``.
+
+UNDER --loss-on decision the training loss lands on one position per example, the
+Yes/No token condition 3 reads, and nothing supervises the prose. Conditions 1 and
+2 are then not meaningful -- the teacher-forced mean over the whole target will not
+fall, and free generation may stop closing with <END> -- so all three are still
+measured and printed exactly as above, but the verdict is condition 3 alone, and
+the closing line says that rule was the one applied. The stop rule moves with it:
+:func:`eval_decision_loss`, the eval-mode decision-token mean per label, read at
+the very positions the training loss used. And the controls are reported a second
+time ON THE DECISION TOKEN, split by label (:func:`print_decision_controls`): real
+against shuffled at that one token is whether knowing which ECG it is changes the
+answer. Under --loss-on all, the default, none of this paragraph applies.
 """
 
 import os
@@ -77,6 +89,8 @@ from evaluate import (  # noqa: E402
     teacher_forced_batch,
 )
 from src.data.dataset import make_collate_fn  # noqa: E402
+from src.teacher.prompt import superclass_answer  # noqa: E402
+from src.teacher.view import build_view  # noqa: E402
 from yn_token_loss import decision_index, tokenise_target  # noqa: E402
 
 # --gate-threshold is the only one of these exposed as a flag; the rest are the
@@ -89,20 +103,25 @@ GATE_DECISION_LOSS = 0.1      # per label subset, at the token after "Conclusion
 CONDITIONS = {1: "teacher-forced loss", 2: "free generation", 3: "decision-token loss"}
 
 
-def gate_batches(tokenizer, dataset, indices, args):
+def gate_batches(tokenizer, dataset, indices, args, collate=None):
     """The overfit examples as the gate's teacher-forced pass batches them.
 
     Same collate, dataset order and batch size as ``run_teacher_forced`` is given in
     :func:`run_gate`, so the stop rule and condition 1 see identical tensors.
     Materialised once: the stop rule walks these every --overfit-eval-every steps,
     and 50 cached embeddings are not worth a worker pool each time.
+
+    ``collate`` replaces the default only to ADD to it: under --loss-on decision
+    train.py passes its own, which is this same collate plus the ``decision_mask``
+    :func:`eval_decision_loss` reads. Every other tensor is unchanged.
     """
     from torch.utils.data import DataLoader, Subset
 
     return list(DataLoader(
         Subset(dataset, indices), batch_size=args.batch_size, shuffle=False,
-        collate_fn=make_collate_fn(tokenizer, max_length=args.max_length,
-                                   strip_think=dataset.config.strip_think)))
+        collate_fn=collate or make_collate_fn(
+            tokenizer, max_length=args.max_length,
+            strip_think=dataset.config.strip_think)))
 
 
 @torch.no_grad()
@@ -120,6 +139,38 @@ def eval_mean_loss(model, resampler, batches, dev, task_stream: str = "prompt") 
             model, resampler, batch, dev, task_stream=task_stream)]
     resampler.train(was_training)
     return float("inf") if None in losses else float(np.mean(losses))
+
+
+@torch.no_grad()
+def eval_decision_loss(model, resampler, batches, dev, task_stream: str = "prompt"):
+    """Condition 3's quantity: eval-mode loss at the decision token, mean per label.
+
+    The --loss-on decision stop rule. Returns ``{"all": mean, True: mean, False:
+    mean}`` over examples, with None for a label that has no examples. The position
+    is the one ``decision_mask`` marks -- the mask the training loss was computed
+    under -- so the stop rule cannot drift from what is being trained;
+    condition 3 then locates the token again from the target text, independently.
+    Leaves the resampler in whichever mode it was found.
+    """
+    was_training = resampler.training
+    resampler.eval()
+    losses, labels = [], []
+    for batch in batches:
+        scored = teacher_forced_batch(model, resampler, batch, dev,
+                                      task_stream=task_stream)
+        for i, (_, _, position_losses) in enumerate(scored):
+            supervised = batch["labels"][i] != -100
+            # .item() is the check: exactly one marked position inside the target
+            k = int(batch["decision_mask"][i][supervised].nonzero().item())
+            losses.append(position_losses[k])
+            labels.append(bool(batch["head_label"][i]))
+    resampler.train(was_training)
+    losses, labels = np.asarray(losses, dtype=np.float64), np.asarray(labels)
+    out = {"all": float(losses.mean())}
+    for label in (True, False):
+        subset = losses[labels == label]
+        out[label] = float(subset.mean()) if subset.size else None
+    return out
 
 
 def locate_decision_tokens(tokenizer, targets, tf_records):
@@ -148,12 +199,22 @@ def locate_decision_tokens(tokenizer, targets, tf_records):
     return out
 
 
-def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, threshold):
+def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, threshold,
+                 loss_on: str = "all"):
     """Print the three conditions with their thresholds; True only if all pass.
 
     Pure on the records, so the verdict can be tested without a model. The four
     sequences are parallel, one entry per example, in the same order.
+
+    ``loss_on`` is train.py's --loss-on, and picks the rule. Under "all" every
+    condition is judged. Under "decision" nothing supervised the prose, so
+    conditions 1 and 2 are measured and printed with their thresholds as ever but
+    marked not judged, and the verdict is condition 3 alone; the closing line names
+    that rule.
     """
+    if loss_on not in ("all", "decision"):
+        raise ValueError(f"unknown loss_on {loss_on!r}")
+    judged = {3} if loss_on == "decision" else set(CONDITIONS)
     n = len(tf_records)
     if not (len(gen_records) == len(decision_losses) == len(target_lengths) == n):
         raise ValueError("the gate's passes cover different numbers of examples")
@@ -201,24 +262,34 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
     print("=" * line_w)
     failed = {}
     for cond, name in CONDITIONS.items():
-        print(f"{cond}. {name}")
+        print(f"{cond}. {name}" + ("" if cond in judged else
+                                   "   [printed, NOT judged under --loss-on decision]"))
         for c, what, measured, need, ok in rows:
             if c != cond:
                 continue
             print(f"     {what:<26} {measured:<44} need {need:<12} "
-                  f"{'PASS' if ok else 'FAIL'}")
-            if not ok:
+                  f"{'PASS' if ok else 'FAIL'}"
+                  + ("" if cond in judged else "  (not judged)"))
+            if not ok and cond in judged:
                 failed.setdefault(cond, []).append(what)
         if cond == 1:
             print(f"     (token-weighted mean {_loss(tf['token_weighted_mean_loss'])}, "
                   "the convention the training loop logs)")
     print("-" * line_w)
+    # Which rule produced the verdict, on the verdict's own line. Empty under "all",
+    # where the line reads as it always has.
+    rule = ("" if loss_on == "all" else
+            "  [--loss-on decision rule: judged on condition 3 alone; conditions 1 "
+            "and 2 are printed, not judged]")
     if not failed:
-        print("GATE PASSED: all three conditions met")
+        print("GATE PASSED: " + (
+            "all three conditions met" if loss_on == "all" else
+            f"condition 3 met, {CONDITIONS[3]} < {GATE_DECISION_LOSS:g} for label=True "
+            "and label=False separately") + rule)
         return True
     print("GATE FAILED: " + "; ".join(
         f"condition {cond} {CONDITIONS[cond]} ({', '.join(whats)})"
-        for cond, whats in failed.items()))
+        for cond, whats in failed.items()) + rule)
     return False
 
 
@@ -344,6 +415,87 @@ def print_controls(by_condition):
     return rows
 
 
+def donor_answers(dataset, shuffled_records):
+    """Per shuffled example: the DONOR record's known answer to that example's question.
+
+    Computed as the dataset computes an example's own label, from the donor's
+    manifest record. It is what a student that reads the prefix should now answer,
+    so it splits the shuffled control into the examples where the wrong ECG asks
+    for a different answer and those where it asks for the same one.
+    """
+    return [superclass_answer(build_view(dataset.manifest[int(r["donor_ecg_id"])]),
+                              r["superclass"]) for r in shuffled_records]
+
+
+def print_decision_controls(decision_by_condition, labels, donor_labels=None):
+    """The real / shuffled / zeroed triple AT THE DECISION TOKEN, split by label.
+
+    ``decision_by_condition`` maps a condition name to its per-example decision-token
+    losses; ``labels`` and ``donor_labels`` (the shuffled donor's answer per example,
+    None when the shuffle did not run) are parallel to them. Each label's row is
+    followed by the part of it whose donor answers the other way: only there does
+    serving the wrong ECG ask for a different token, so a label's whole-row gap is
+    diluted by however many of its donors happen to share its answer. Mean over
+    examples throughout. Pure on its arguments; returns the rows.
+    """
+    labels = np.asarray(labels, dtype=bool)
+    names = [name for name, _ in CONTROL_CONDITIONS]
+    dec = {name: np.asarray(decision_by_condition[name], dtype=np.float64)
+           for name in names if name in decision_by_condition}
+    subsets = [("all", np.ones(labels.size, dtype=bool))]
+    for label in (True, False):
+        subsets.append((f"label={label}", labels == label))
+        if donor_labels is not None:
+            differs = np.asarray(donor_labels, dtype=bool) != labels
+            subsets.append((f"  donor answers {'No' if label else 'Yes'}",
+                            (labels == label) & differs))
+
+    rows = []
+    for what, mask in subsets:
+        means = {name: float(v[mask].mean()) if mask.any() else None
+                 for name, v in dec.items()}
+        real = means.get("real")
+        rows.append({"subset": what.strip(), "label": what, "n": int(mask.sum()),
+                     "mean_loss": means,
+                     "gap_nats": {name: None if None in (mean, real) else mean - real
+                                  for name, mean in means.items() if name != "real"}})
+
+    controls = [name for name in names if name != "real"]
+    line_w = 22 + 6 + 11 * len(names) + 18 * len(controls)
+    print("\n" + "=" * line_w)
+    print(f"GATE CONTROLS ON THE DECISION TOKEN, the same {labels.size} examples "
+          "(diagnostic, not in the verdict)")
+    print("=" * line_w)
+    print(f"{'decision-token loss':<22}{'n':>6}" + "".join(f"{n:>11}" for n in names)
+          + "".join(f"{n + ' - real':>18}" for n in controls))
+    print("-" * line_w)
+    for row in rows:
+        cells = "".join(f"{_loss(row['mean_loss'][n]) if n in dec else 'not run':>11}"
+                        for n in names)
+        gaps = "".join(
+            f"{'' if row['gap_nats'].get(n) is None else format(row['gap_nats'][n], '+.4f'):>18}"
+            for n in controls)
+        print(f"{row['label']:<22}{row['n']:>6}{cells}{gaps}")
+    print("-" * line_w)
+    print("loss at the single Yes/No token after \"Conclusion:\", mean over examples; "
+          "gap = control - real.")
+    print("real vs shuffled near zero => the answer does not depend on WHICH ECG it "
+          "is given.")
+    print("real vs zeroed   near zero => it does not depend on the prefix AT ALL.")
+    if donor_labels is not None:
+        print("'donor answers' rows: the examples of that label whose shuffled-in ECG "
+              "has the OTHER known\nanswer to the same question. The rest were served "
+              "an ECG with their own answer, where a\nstudent that reads the prefix "
+              "loses nothing -- so read the shuffled gap on these rows.")
+        if not differs.any():
+            print("NOTE: NO example was served an ECG with a different known answer: "
+                  "every record in this set\nanswers every question the same way, so "
+                  "the answer is a function of the question alone. The\nshuffled "
+                  "column cannot show whether the ECG is read here, and a decision-"
+                  "token loss near\nzero does not need it to be.")
+    return rows
+
+
 def run_controls(ctx, dataset, indices, args, real_records, shuffled_view):
     """The teacher-forced pass again under each control, and the table.
 
@@ -409,8 +561,19 @@ def run_gate(model, resampler, tokenizer, dataset, indices, args) -> bool:
     targets = [dataset.examples[i].target for i in indices]
     located = locate_decision_tokens(tokenizer, targets, tf_records)
 
-    run_controls(ctx, dataset, indices, args, tf_records, shuffled_view)
+    by_condition = run_controls(ctx, dataset, indices, args, tf_records, shuffled_view)
+    if args.loss_on == "decision":
+        # Still diagnostic: the verdict below reads `located`, the real pass alone.
+        # Each control goes through the same locator and the same fatal length check.
+        decision = {name: [loss for loss, _ in
+                           (located if name == "real" else
+                            locate_decision_tokens(tokenizer, targets, recs))]
+                    for name, recs in by_condition.items()}
+        print_decision_controls(
+            decision, [r["label"] for r in tf_records],
+            donor_answers(dataset, by_condition["shuffled"])
+            if "shuffled" in by_condition else None)
 
     return gate_verdict(tf_records, gen_records,
                         [loss for loss, _ in located], [n for _, n in located],
-                        args.gate_threshold)
+                        args.gate_threshold, loss_on=args.loss_on)

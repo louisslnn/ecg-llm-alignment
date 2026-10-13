@@ -39,10 +39,40 @@
 # for probing with --ckpt, not for resuming). The log's last line repeats the
 # verdict and gives its path.
 #
+# TWO OTHER GATES, each an env override; an unmodified submission is the gate above.
+#   LOSS_ON=decision            train on ONE position per example, the Yes/No token
+#                               after "Conclusion:" (--loss-on; default all). The
+#                               verdict is then condition 3 alone.
+#   OVERFIT_SELECT=stratified   draw the 10 records so every superclass has at least
+#                               three Yes and three No (--overfit-select; default
+#                               head, the first 50 examples, where all ten records
+#                               are normal and the answer follows from the question).
+# Either one moves the default CKPT_DIR (overfit_gate_decision, overfit_gate_stratified,
+# overfit_gate_decision_stratified): every gate writes the same file names, and a
+# different experiment must not land on the baseline's records and overfit_final.pt.
+#
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 # Submit from the repo root after `mkdir -p logs`:
 #   sbatch scripts/train_overfit.sh
+#   LOSS_ON=decision OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
 set -euo pipefail
+
+# --- which gate --------------------------------------------------------------
+LOSS_ON="${LOSS_ON:-all}"
+OVERFIT_SELECT="${OVERFIT_SELECT:-head}"
+# Caught again in train.py; repeated here so a typo fails in seconds, before the
+# module load and the 14B, instead of after.
+case "$LOSS_ON" in all|decision) ;; *)
+    echo "LOSS_ON must be all or decision, got '$LOSS_ON'" >&2; exit 2 ;;
+esac
+case "$OVERFIT_SELECT" in head|stratified) ;; *)
+    echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
+esac
+# Named into the default checkpoint dir below, and only when not the default, so
+# the baseline gate keeps the directory it has always had.
+GATE_TAG=""
+[[ "$LOSS_ON" == "all" ]] || GATE_TAG+="_$LOSS_ON"
+[[ "$OVERFIT_SELECT" == "head" ]] || GATE_TAG+="_$OVERFIT_SELECT"
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
@@ -66,20 +96,23 @@ if [[ -n "$missing" ]]; then
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/overfit_gate}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/overfit_gate$GATE_TAG}"
 
 source "$VENV/bin/activate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 mkdir -p "$CKPT_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
-echo "host: $(hostname)   model: $MODEL_DIR"
+echo "host: $(hostname)   model: $MODEL_DIR   loss_on: $LOSS_ON   overfit_select: $OVERFIT_SELECT"
+echo "ckpt: $CKPT_DIR"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 srun python scripts/train.py \
     --model-dir "$MODEL_DIR" \
     --ckpt-dir "$CKPT_DIR" \
     --overfit 50 \
+    --overfit-select "$OVERFIT_SELECT" \
+    --loss-on "$LOSS_ON" \
     --batch-size 4 \
     --overfit-target-loss 0.05 \
     --overfit-max-steps 3000

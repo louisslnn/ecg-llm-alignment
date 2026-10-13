@@ -44,12 +44,25 @@
 # accepted at scale 1 (train.py refuses the combination too); with both norms off
 # the resampler is the reference architecture exactly.
 #
+# WHICH GATE, two env overrides; unset, the point is the one it has always been:
+#
+#   LOSS_ON=decision sbatch scripts/gate_scale.sh 1
+#                              -> logs/gate_scale1_400steps_lr1e-4_decision.log
+#   OVERFIT_SELECT=stratified sbatch scripts/gate_scale.sh 1
+#                              -> logs/gate_scale1_400steps_lr1e-4_stratified.log
+#
+# LOSS_ON (--loss-on, default all) puts the loss on the Yes/No token alone, and the
+# verdict is then condition 3 alone. OVERFIT_SELECT (--overfit-select, default head)
+# draws the 10 records so every superclass has at least three Yes and three No,
+# where head's ten are all normal. Like the norm flags, a non-default value goes
+# into the log name and the checkpoint dir.
+#
 # Every run's log and checkpoint directory are named for what produced them --
 # logs/gate_scale<scale>_<steps>steps_lr<lr><flags>.log -- so several can be in the
 # queue at once without touching each other.
 #
-# WHAT VARIES: --prefix-scale, the step cap, the LR and the two norm flags,
-# nothing else.
+# WHAT VARIES: --prefix-scale, the step cap, the LR, the two norm flags and the
+# two env overrides, nothing else.
 # The prompt has the template's trailing <think> block stripped
 # (DatasetConfig.strip_think, on by default), so a difference between runs can only
 # come from how loud the prefix is and which norms are present. Sweep points run
@@ -108,6 +121,8 @@ usage() {
     echo "   --steps is the --overfit-max-steps cap (default $DEFAULT_STEPS)"
     echo "   --lr is the AdamW learning rate (default $DEFAULT_LR, as train.py uses"
     echo "        in --overfit mode); accepts 1e-4 or 0.0001"
+    echo "   env: LOSS_ON=all|decision (default all),"
+    echo "        OVERFIT_SELECT=head|stratified (default head)"
 }
 
 SCALE=""
@@ -202,6 +217,20 @@ if (( NO_OUTPUT )); then
     EXTRA+=(--no-output-norm)
     TAG+="_nooutput"
 fi
+# Which gate this point is. Tagged only when not the default, so every existing
+# point keeps its log name and checkpoint dir.
+LOSS_ON="${LOSS_ON:-all}"
+OVERFIT_SELECT="${OVERFIT_SELECT:-head}"
+# Caught again in train.py; repeated here so a typo fails in seconds, before the
+# module load and the 14B, instead of after.
+case "$LOSS_ON" in all|decision) ;; *)
+    echo "LOSS_ON must be all or decision, got '$LOSS_ON'" >&2; exit 2 ;;
+esac
+case "$OVERFIT_SELECT" in head|stratified) ;; *)
+    echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
+esac
+[[ "$LOSS_ON" == "all" ]] || TAG+="_$LOSS_ON"
+[[ "$OVERFIT_SELECT" == "head" ]] || TAG+="_$OVERFIT_SELECT"
 # Caught again in train.py; repeated here so it fails in seconds, before the module
 # load and the 14B, instead of after.
 if (( NO_OUTPUT )) && [[ "$(printf '%g' "$SCALE")" != "1" ]]; then
@@ -232,7 +261,7 @@ if [[ -n "$missing" ]]; then
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-# One directory per (scale, steps, lr, flags) point, so queued jobs cannot collide.
+# One directory per (scale, steps, lr, flags, gate) point, so queued jobs cannot collide.
 CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/gate_scale$TAG}"
 TARGET_LOSS="${TARGET_LOSS:-0.05}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -243,7 +272,7 @@ mkdir -p "$CKPT_DIR" logs
 
 cd "$SLURM_SUBMIT_DIR"
 LOG="logs/gate_scale${TAG}.log"
-echo "host: $(hostname)   prefix_scale: $SCALE   steps: $STEPS   lr: $LR   flags: ${EXTRA[*]:-none}"
+echo "host: $(hostname)   prefix_scale: $SCALE   steps: $STEPS   lr: $LR   flags: ${EXTRA[*]:-none}   loss_on: $LOSS_ON   overfit_select: $OVERFIT_SELECT"
 echo "ckpt: $CKPT_DIR   log: $LOG"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
@@ -257,6 +286,8 @@ srun python scripts/train.py \
     --prefix-scale "$SCALE" \
     ${EXTRA[@]+"${EXTRA[@]}"} \
     --overfit 50 \
+    --overfit-select "$OVERFIT_SELECT" \
+    --loss-on "$LOSS_ON" \
     --batch-size "$BATCH_SIZE" \
     --overfit-target-loss "$TARGET_LOSS" \
     --overfit-max-steps "$STEPS" \

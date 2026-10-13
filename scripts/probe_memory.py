@@ -141,7 +141,8 @@ def check_gradients(model, resampler):
     return norms
 
 
-def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt"):
+def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
+                   loss_on: str = "all"):
     """The validated splice: prepend resampler latents to the token embeddings and
     run the frozen LLM, loss on the target only. Returns ``out.loss``.
 
@@ -161,6 +162,20 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt"):
 
     ``input_ids`` is untouched either way: the LLM still sees prompt + target + EOS
     and ``labels`` still supervises the target positions alone.
+
+    ``loss_on`` selects which of those target positions contribute:
+
+        "all"       every one (the default); ``out.loss`` is the token-weighted mean
+                    over the batch's targets.
+        "decision"  one per example, the position ``batch["decision_mask"]`` marks
+                    (train.py's make_decision_collate builds it: the Yes/No token
+                    after "Conclusion:"). ``out.loss`` is then the mean of the
+                    decision-token loss over the batch's examples.
+
+    Nothing else differs between the two: same inputs, same prefix, same task
+    stream. In particular the task mask is read off the FULL labels, before they are
+    narrowed -- prompt_only_task_mask takes every -100 for prompt, so narrowing
+    first would hand the resampler the target.
     """
     ecg = batch["ecg_embed"].to(dev)
     input_ids = batch["input_ids"].to(dev)
@@ -168,6 +183,17 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt"):
     labels = batch["labels"].to(dev)
     task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
                  else attn.bool())
+    if loss_on == "decision":
+        labels = labels.masked_fill(~batch["decision_mask"].to(dev), -100)
+        # The mean below is over supervised positions, so a row with none would
+        # leave it without a trace: the batch would be a mean over fewer examples.
+        per_row = (labels != -100).sum(dim=1)
+        if not bool((per_row == 1).all()):
+            raise ValueError("--loss-on decision needs exactly one supervised "
+                             f"position per example, got {per_row.tolist()} for "
+                             f"{list(zip(batch['ecg_id'], batch['superclass']))}")
+    elif loss_on != "all":
+        raise ValueError(f"unknown loss_on {loss_on!r}")
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)          # (B, L, 5120)
