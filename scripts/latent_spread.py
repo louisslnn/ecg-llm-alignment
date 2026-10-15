@@ -80,7 +80,7 @@ from src.data.dataset import (  # noqa: E402
     DatasetConfig,
     build_datasets,
     make_collate_fn,
-    prompt_only_task_mask,
+    task_stream_ids,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
@@ -187,9 +187,10 @@ def gate_indices(dataset, payload, run):
 def gate_examples(dataset, indices, run, tokenizer, embed):
     """The examples the gate trained on, as the resampler's two input streams.
 
-    Each goes through training's own collate and task mask, one at a time, and the
-    stream is cut to the positions the mask keeps: a masked key has attention weight
-    exactly zero, so dropping it is the same forward without the CPU time.
+    Each goes through training's own collate and the run's task stream
+    (task_stream_ids), one at a time, and the stream is cut to the positions the
+    mask keeps: a masked key has attention weight exactly zero, so dropping it is
+    the same forward without the CPU time. Under --task-stream none it is empty.
 
     Returns ``(ecg, task, prompts)``: ecg_id -> (312, 768), and
     (ecg_id, superclass) -> the (T, embed_dim) fp32 stream and the prompt's text.
@@ -199,13 +200,10 @@ def gate_examples(dataset, indices, run, tokenizer, embed):
     ecg, task, prompts = {}, {}, {}
     for i in indices:
         item = dataset[i]
-        batch = collate([item])
-        attn, labels = batch["attention_mask"], batch["labels"]
-        mask = (prompt_only_task_mask(attn, labels) if run["task_stream"] == "prompt"
-                else attn.bool())
+        ids, mask = task_stream_ids(collate([item]), run["task_stream"])
         key = (int(item["ecg_id"]), item["superclass"])
         ecg[key[0]] = item["ecg_embed"]
-        task[key] = embed[batch["input_ids"][0][mask[0]]].float()
+        task[key] = embed[ids[0][mask[0]]].float()
         prompts[key] = item["task_prompt"]
     return ecg, task, prompts
 

@@ -112,8 +112,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.data.dataset import (  # noqa: E402
     DEFAULT_FOLD_SPLITS,
+    TASK_STREAM_MODES,
     DatasetConfig,
     make_collate_fn,
+    task_stream_ids,
 )
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 # The metrics the model itself is scored with, so the probe and the pipeline are
@@ -139,7 +141,9 @@ from probe_embeddings import (  # noqa: E402
 )
 
 QUESTION_MODES = ("pooled", "matched", "fixed")
-TASK_TEXT_MODES = ("prompt", "prompt-and-target")
+# train.py's --task-stream modes; "question" and "none" read the eval collate's
+# separate question stream, or nothing.
+TASK_TEXT_MODES = TASK_STREAM_MODES
 
 
 def parse_args():
@@ -159,7 +163,10 @@ def parse_args():
                          "the prompt alone, as generation feeds it. "
                          "'prompt-and-target' is what train.py feeds -- the prompt "
                          "AND the target, conclusion included -- and features built "
-                         "that way can read the label out of the text (default: prompt)")
+                         "that way can read the label out of the text. 'question' is "
+                         "the question paraphrase alone, 'none' no text: what a "
+                         "checkpoint trained with that --task-stream reads "
+                         "(default: prompt)")
     ap.add_argument("--variants", nargs="+", default=["centered"], choices=VARIANTS,
                     help="feature transforms to run (default: centered only)")
     ap.add_argument("--shuffle-embeddings", action="store_true",
@@ -222,7 +229,7 @@ def build_data_config(args) -> DatasetConfig:
 
 
 @torch.no_grad()
-def latent_vectors(model, resampler, batch, dev) -> np.ndarray:
+def latent_vectors(model, resampler, batch, dev, task_text: str = "prompt") -> np.ndarray:
     """Mean-pooled resampler output for one batch: (B, embed_dim), float32.
 
     The forward is the training/eval one (scripts/evaluate.py splice_prefix, minus
@@ -230,12 +237,11 @@ def latent_vectors(model, resampler, batch, dev) -> np.ndarray:
     of the prompt, masked exactly as training masked it. Pooling over the 64 latent
     positions mirrors the embedding probe's pooling over its 312 input positions.
     """
-    input_ids = batch["input_ids"].to(dev)
-    attn = batch["attention_mask"].to(dev)
+    task_ids, task_mask = task_stream_ids(batch, task_text)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        tok_embeds = model.get_input_embeddings()(input_ids)
+        task_embeds = model.get_input_embeddings()(task_ids.to(dev))
         latents = resampler(batch["ecg_embed"].to(dev),
-                            task_embeddings=tok_embeds, task_mask=attn.bool())
+                            task_embeddings=task_embeds, task_mask=task_mask.to(dev))
     return latents.float().mean(dim=1).cpu().numpy()
 
 
@@ -259,7 +265,7 @@ def build_collate(ctx, dataset, args, task_text: Optional[str] = None):
     """
     mode = task_text or args.task_text
     strip_think = base_of(dataset).config.strip_think
-    if mode == "prompt":
+    if mode != "prompt-and-target":     # question and none read the eval collate too
         return make_eval_collate(ctx.tokenizer, max_prompt_length=args.max_length,
                                  strip_think=strip_think)
     return make_collate_fn(ctx.tokenizer, max_length=args.max_length,
@@ -283,13 +289,13 @@ def describe_task_stream(ctx, dataset, args) -> Dict[str, object]:
 
     def stream(mode: str) -> Tuple[str, int]:
         batch = build_collate(ctx, dataset, args, task_text=mode)([dict(item)])
-        ids = batch["input_ids"][0][batch["attention_mask"][0].bool()]
+        ids, mask = task_stream_ids(batch, mode)
+        ids = ids[0][mask[0]]
         return ctx.tokenizer.decode(ids, skip_special_tokens=False), int(ids.numel())
 
     prompt_text, n_prompt = stream("prompt")
     train_text, n_train = stream("prompt-and-target")
-    used_text, n_used = (prompt_text, n_prompt) if args.task_text == "prompt" \
-        else (train_text, n_train)
+    used_text, n_used = stream(args.task_text)
     has_target = target.strip() in used_text
     is_prefix = train_text.startswith(prompt_text)
 
@@ -317,6 +323,10 @@ def describe_task_stream(ctx, dataset, args) -> Dict[str, object]:
               f"     prompt PLUS the target ({n_train - n_prompt} more tokens), so the\n"
               "     resampler was trained on a stream it never sees at generation\n"
               "     time. Run --task-text prompt-and-target to probe that one.")
+    elif args.task_text in ("question", "none"):
+        print(f"\n  -> the stream is {'the QUESTION ALONE' if n_used else 'EMPTY'}: "
+              "no patient context, no\n     target. The LLM still receives the full "
+              "prompt; only the resampler's\n     second stream differs.")
     else:
         print("\n  -> this is byte-identical to train.py's stream, and it CONTAINS\n"
               "     THE TARGET, conclusion included. A probe on these features can\n"
@@ -356,7 +366,7 @@ def record_features(ctx, dataset, indices: List[int], args, label: str, collate
     t0 = time.time()
     done = 0
     for batch in loader:
-        vecs = latent_vectors(ctx.model, ctx.resampler, batch, ctx.dev)
+        vecs = latent_vectors(ctx.model, ctx.resampler, batch, ctx.dev, args.task_text)
         for b, eid in enumerate(batch["ecg_id"]):
             eid = int(eid)
             if eid in sums:

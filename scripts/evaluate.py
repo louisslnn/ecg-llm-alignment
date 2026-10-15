@@ -117,7 +117,8 @@ from src.data.dataset import (  # noqa: E402
     _format_prompt,
     build_datasets,
     make_collate_fn,
-    prompt_only_task_mask,
+    question_stream_tensors,
+    task_stream_ids,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 from src.teacher import parse as teacher_parse  # noqa: E402
@@ -167,14 +168,16 @@ def parse_args():
     ap.add_argument("--max-length", type=int, default=2048,
                     help="token cap for prompt+target in --teacher-forced-loss "
                          "(training's MAX_TEXT_LEN)")
-    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default="prompt",
-                    help="what the RESAMPLER's task-text stream may read in "
-                         "--teacher-forced-loss. 'prompt' (default) restricts it to "
-                         "the real prompt tokens; 'prompt-and-target' leaves the "
-                         "target in, reproducing run 1. GENERATION IGNORES THIS: its "
-                         "input_ids are the prompt already, so it is prompt-only "
-                         "whatever this says -- which is the mismatch the flag exists "
-                         "to measure. Neither setting changes the loss positions")
+    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default=None,
+                    help="what the RESAMPLER's task-text stream reads. Default: the "
+                         "mode the checkpoint recorded (train.py's --task-stream), or "
+                         "'prompt' for a checkpoint that predates the record. "
+                         "'prompt' is the real prompt tokens; 'prompt-and-target' "
+                         "leaves the target in, reproducing run 1 -- in --teacher-"
+                         "forced-loss only: generation has no target, so there it is "
+                         "the prompt. 'question' is the question paraphrase alone, "
+                         "tokenised separately; 'none' is no text. Neither changes "
+                         "what the LLM receives or the loss positions")
     ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
                     default=DatasetConfig.strip_think,
                     help="strip the template's trailing open <think> block from the "
@@ -529,10 +532,16 @@ def make_eval_collate(tokenizer, max_prompt_length: int, strip_think: bool = Tru
             input_ids[i, max_len - n:] = torch.tensor(ids, dtype=torch.long)  # left pad
             attention_mask[i, max_len - n:] = 1
 
+        # The question stream, as the training collate carries it; whether the
+        # resampler reads it is task_stream_ids' decision.
+        task_input_ids, task_attention_mask = question_stream_tensors(
+            tokenizer, [b["question"] for b in batch], pad_id)
         return {
             "ecg_embed": ecg_embed,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "task_input_ids": task_input_ids,
+            "task_attention_mask": task_attention_mask,
             "prompt": prompts,
             "ecg_id": [int(b["ecg_id"]) for b in batch],
             "donor_ecg_id": [int(b.get("donor_ecg_id", b["ecg_id"])) for b in batch],
@@ -575,6 +584,47 @@ def checkpoint_strip_think(ckpt_path: str):
     if isinstance(meta, dict) and meta.get("strip_think") is not None:
         return bool(meta["strip_think"]), True
     return False, False
+
+
+def checkpoint_task_stream(ckpt_path: str) -> Optional[str]:
+    """The --task-stream a checkpoint was trained with, or None if it has no record.
+
+    Recorded in the meta since the flag existed (124b2a2), so None means a
+    checkpoint older than that, whose resampler read the whole of input_ids --
+    prompt-and-target -- in training. What None should default to is the caller's
+    decision: a resume and an evaluation answer it differently.
+    """
+    path = resolve_ckpt_path(ckpt_path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except (TypeError, RuntimeError, ValueError):    # older torch, or a legacy-format file
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    return meta.get("task_stream") if isinstance(meta, dict) else None
+
+
+def resolve_task_stream(ckpt_path: str, requested: Optional[str]) -> str:
+    """The task stream an evaluation runs with, and where it came from, printed.
+
+    An explicit --task-stream wins, so a deliberate comparison (run 1's
+    prompt-and-target against prompt, say) stays possible; a disagreement with the
+    checkpoint is printed, not refused. Unset, it is the checkpoint's own mode: a
+    resampler trained on the question alone is never silently handed the full
+    prompt. A checkpoint with no record gets 'prompt', the default every evaluation
+    before the record used.
+    """
+    trained = checkpoint_task_stream(ckpt_path)
+    if requested is None:
+        mode = trained or "prompt"
+        source = ("recorded in the checkpoint" if trained else
+                  "the checkpoint has no record, so the pre-record default")
+    else:
+        mode, source = requested, "--task-stream"
+    print(f"resampler task stream: {mode} ({source})", flush=True)
+    if trained and mode != trained:
+        print(f"  NOTE: the checkpoint trained with --task-stream {trained}; this run "
+              f"feeds its resampler {mode}", flush=True)
+    return mode
 
 
 def require_strip_think_match(ckpt_path: str, strip_think: bool,
@@ -739,7 +789,7 @@ def prefix_scale_report(latents, tok_embeds, attn, label="prompt"):
 
 
 def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False,
-                  report_label=None, task_mask=None):
+                  report_label=None, task_ids=None, task_mask=None):
     """Token embeddings with the resampler's latents spliced in front.
 
     The splice is the training splice (scripts/probe_memory.py splice_forward):
@@ -754,18 +804,20 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
     ``report_label`` prints the prefix-vs-token norm comparison for this batch; the
     callers pass it on the first batch only.
 
-    ``task_mask`` is what the resampler's task-text stream may read (True = attend).
-    None falls back to ``attn``, i.e. every real token in ``input_ids``. Generation
-    passes None because its ``input_ids`` ARE the prompt; the teacher-forced path
-    passes :func:`~src.data.dataset.prompt_only_task_mask`, whose ``input_ids`` also
-    hold the target. The splice itself is unaffected: the LLM still receives every
-    token either way.
+    ``task_ids`` / ``task_mask`` are the resampler's task-text stream and what of it
+    may be read (True = attend), as :func:`~src.data.dataset.task_stream_ids` builds
+    them for the run's --task-stream. None falls back to ``input_ids`` / ``attn``,
+    every real token the LLM receives. The splice itself is unaffected: the LLM
+    receives ``input_ids`` whatever the resampler read.
     """
+    if task_ids is None:
+        task_ids = input_ids
     if task_mask is None:
         task_mask = attn.bool()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask.bool())
+        latents = resampler(ecg, task_embeddings=model.get_input_embeddings()(task_ids),
+                            task_mask=task_mask.bool())
     if zero_latents:
         latents = torch.zeros_like(latents)
     # torch.cat needs one dtype; autocast can hand back fp32 from a LayerNorm-final
@@ -785,17 +837,21 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
 
 @torch.no_grad()
 def generate_batch(model, resampler, tokenizer, batch, dev, processors, capture,
-                   gen_config, zero_latents=False, report_label=None):
+                   gen_config, zero_latents=False, report_label=None,
+                   task_stream: str = "prompt"):
     """One batch: splice latents in front of the prompt, then greedy-decode to <END>.
 
     Left padding means the pads sit between the latents and the real prompt; position
     ids are derived from the attention mask, so the real tokens still see the latents
-    at the positions training put them.
+    at the positions training put them. The resampler reads ``task_stream``; this
+    collate has no labels, so the two prompt modes are both the whole prompt here.
     """
+    task_ids, task_mask = task_stream_ids(batch, task_stream)
     full_embeds, full_attn, _ = splice_prefix(
         model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
         batch["attention_mask"].to(dev), dev, zero_latents=zero_latents,
-        report_label=report_label,
+        report_label=report_label, task_ids=task_ids.to(dev),
+        task_mask=task_mask.to(dev),
     )
 
     capture.reset()
@@ -830,15 +886,14 @@ def teacher_forced_batch(model, resampler, batch, dev, zero_latents=False,
     """
     labels = batch["labels"].to(dev)
     attn = batch["attention_mask"].to(dev)
-    # Only the RESAMPLER's view narrows. input_ids below is the whole sequence and
+    # Only the RESAMPLER's view changes. input_ids below is the whole sequence and
     # full_labels below still supervises every target position, so the teacher
     # forcing is byte-for-byte what it was.
-    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
-                 else attn.bool())
+    task_ids, task_mask = task_stream_ids(batch, task_stream)
     full_embeds, full_attn, Lq = splice_prefix(
         model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
         attn, dev, zero_latents=zero_latents, report_label=report_label,
-        task_mask=task_mask,
+        task_ids=task_ids.to(dev), task_mask=task_mask.to(dev),
     )
     B = labels.shape[0]
     full_labels = torch.cat(
@@ -1171,11 +1226,12 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
                    split: str, seed: int, shuffled: bool, zero_latents: bool,
                    max_new_tokens: int, batch_size: int, num_workers: int = 4,
                    max_prompt_length: int = 1024, print_first: int = 0,
-                   log_every: int = 20, mode: str = "w"):
+                   log_every: int = 20, mode: str = "w", task_stream: str = "prompt"):
     """Generate over ``indices``, writing one jsonl line per example as it lands.
 
     Returns ``(records, n_impure, elapsed)``. Written so a caller can run it several
-    times on one loaded context, once per condition.
+    times on one loaded context, once per condition. ``task_stream`` is what the
+    resampler reads; it has to be the mode the checkpoint trained with.
     """
     from torch.utils.data import DataLoader, Subset
 
@@ -1191,7 +1247,7 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
     print(f"greedy decoding, max_new_tokens={max_new_tokens}, stop at {END_MARKER}, "
           f"batch {batch_size}; decoding config set explicitly "
           f"(repetition_penalty {gen_config.repetition_penalty}, "
-          f"do_sample {gen_config.do_sample})"
+          f"do_sample {gen_config.do_sample}); resampler task stream {task_stream}"
           + ("  [ZERO-LATENTS CONTROL: the prefix carries nothing]" if zero_latents else ""))
 
     mismatch = bool(ctx.strip_think_check.get("strip_think_mismatch", False))
@@ -1205,7 +1261,8 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
                                        ctx.dev, ctx.processors, ctx.capture, gen_config,
                                        zero_latents=zero_latents,
                                        # the prefix-scale check, once per pass
-                                       report_label="prompt" if bi == 0 else None)
+                                       report_label="prompt" if bi == 0 else None,
+                                       task_stream=task_stream)
             steps = ctx.capture.steps   # steps[t][b] = logits over cand_ids at step t
             for b in range(sequences.shape[0]):
                 gen_ids = trim_generated(sequences[b].tolist(), ctx.eos_id, ctx.pad_id)
@@ -1239,6 +1296,7 @@ def run_generation(ctx: EvalContext, dataset, indices: Sequence[int], out_path: 
                     # True only under --allow-strip-think-mismatch
                     "strip_think_mismatch": mismatch,
                     "donor_ecg_id": batch["donor_ecg_id"][b] if shuffled else None,
+                    "task_stream": task_stream,
                     "seed": seed,
                 }
                 records.append(rec)
@@ -1288,7 +1346,7 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
                                    strip_think=base_of(dataset).config.strip_think),
     )
     print(f"teacher-forced loss over {len(indices):,} examples, batch {batch_size}, "
-          f"max_length {max_length}"
+          f"max_length {max_length}, resampler task stream {task_stream}"
           + ("  [ZERO-LATENTS CONTROL]" if zero_latents else ""))
 
     mismatch = bool(ctx.strip_think_check.get("strip_think_mismatch", False))
@@ -1380,6 +1438,7 @@ def main():
 
     data_cfg = build_data_config(args)
     preflight(args, data_cfg)
+    args.task_stream = resolve_task_stream(args.ckpt, args.task_stream)
     done_keys, mode = ((set(), "w") if args.teacher_forced_loss else check_resume(args))
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; generation needs GPUs")
@@ -1390,14 +1449,9 @@ def main():
     dataset = load_split(data_cfg, args.split)
     if args.shuffle_embeddings:
         dataset = apply_shuffle(dataset, args.seed)
-    if args.teacher_forced_loss:
-        print(f"resampler task stream: {args.task_stream}"
-              + ("  (prompt tokens only -- what generation feeds it)"
-                 if args.task_stream == "prompt"
-                 else "  (target included -- reproducing run 1's training stream)"))
-    elif args.task_stream != "prompt":
-        print(f"note: --task-stream {args.task_stream} is ignored during generation; "
-              "its input_ids are the prompt already")
+    if not args.teacher_forced_loss and args.task_stream == "prompt-and-target":
+        print("note: --task-stream prompt-and-target reads the prompt during "
+              "generation; there is no target at inference to include")
     if args.zero_latents:
         print("*** ZERO-LATENTS CONTROL ACTIVE ***")
         print("    the resampler still runs; its output is replaced by zeros of the "
@@ -1466,6 +1520,7 @@ def main():
         max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
         num_workers=args.num_workers, max_prompt_length=args.max_prompt_length,
         print_first=args.print_first, log_every=args.log_every, mode=mode,
+        task_stream=args.task_stream,
     )
 
     # ---- metrics -----------------------------------------------------------
@@ -1484,8 +1539,10 @@ def main():
         "seed": args.seed,
         "limit": args.limit,
         "max_new_tokens": args.max_new_tokens,
-        # generation's stream is the prompt by construction, whatever the flag says
-        "task_stream": "prompt",
+        # what the resampler read; prompt-and-target has no target here, so it read
+        # the prompt
+        "task_stream": ("prompt" if args.task_stream == "prompt-and-target"
+                        else args.task_stream),
         "batch_size": args.batch_size,
         "generations": args.out,
         "n_records": len(all_records),

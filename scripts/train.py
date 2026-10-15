@@ -65,7 +65,7 @@ from src.data.dataset import (  # noqa: E402
     DatasetConfig,
     build_datasets,
     make_collate_fn,
-    prompt_only_task_mask,
+    task_stream_ids,
 )
 from src.model.resampler import (  # noqa: E402
     PerceiverResamplerConfig,
@@ -73,7 +73,7 @@ from src.model.resampler import (  # noqa: E402
     mean_embedding_norm,
 )
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
-from evaluate import require_strip_think_match  # noqa: E402
+from evaluate import checkpoint_task_stream, require_strip_think_match  # noqa: E402
 from overfit_gate import (  # noqa: E402
     GATE_DECISION_LOSS,
     eval_decision_loss,
@@ -139,9 +139,14 @@ def parse_args():
                          "(default) is the real prompt tokens only, which is what "
                          "generation feeds it. 'prompt-and-target' is what run 1 "
                          "trained on: the target is in the stream, so the resampler "
-                         "can read the answer it will not have at inference. Neither "
-                         "setting changes what the LLM receives or where the loss "
-                         "lands -- only the resampler's second stream")
+                         "can read the answer it will not have at inference. "
+                         "'question' is a separate tokenisation of the question "
+                         "paraphrase alone, \"Question: ...\\nAnswer:\", with no "
+                         "patient context, as chathealthAI_train.py feeds its "
+                         "resampler. 'none' is no text at all, the zero-text "
+                         "ablation. No setting changes what the LLM receives or "
+                         "where the loss lands -- only the resampler's second stream. "
+                         "Recorded in every checkpoint; a resume must match it")
     ap.add_argument("--loss-on", choices=LOSS_ON_MODES, default="all",
                     help="which target positions the loss is computed on. 'all' "
                          "(default) is every target token. 'decision' is exactly one "
@@ -393,6 +398,27 @@ def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
     torch.save(payload, path + ".tmp")
     os.replace(path + ".tmp", path)          # atomic
     return path
+
+
+def require_task_stream_match(path, task_stream):
+    """Refuse to resume a checkpoint on a resampler stream it did not train on.
+
+    Read from the meta with mmap, before the student loads. A checkpoint with no
+    entry predates --task-stream (124b2a2), when the resampler read the whole of
+    input_ids: that is prompt-and-target, NOT today's default. There is no way
+    through: the resampler's second input changing mid-run is not an experiment.
+    """
+    recorded = checkpoint_task_stream(path)
+    trained = recorded or "prompt-and-target"
+    if trained == task_stream:
+        return
+    source = ("recorded in its meta" if recorded else
+              "NOT recorded: the checkpoint predates the flag, when the resampler "
+              "read the whole of input_ids")
+    sys.exit(f"task-stream MISMATCH: {path} was trained with --task-stream {trained} "
+             f"({source}), this run has --task-stream {task_stream}. Resuming would "
+             "hand the resampler a second input it never trained on. Pass "
+             f"--task-stream {trained}, or a fresh --ckpt-dir.")
 
 
 def resume(ckpt_dir, resampler, optimizer, dev, loss_on="all"):
@@ -671,12 +697,11 @@ def prefix_scale_line(model, resampler, batch, dev, task_stream: str = "prompt")
     ecg = batch["ecg_embed"].to(dev)
     input_ids = batch["input_ids"].to(dev)
     attn = batch["attention_mask"].to(dev)
-    labels = batch["labels"].to(dev)
-    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
-                 else attn.bool())
+    task_ids, task_mask = task_stream_ids(batch, task_stream)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask)
+        latents = resampler(ecg, task_embeddings=model.get_input_embeddings()(
+            task_ids.to(dev)), task_mask=task_mask.to(dev))
     lat = float(latents.float().norm(dim=-1).mean())
     tok = float(tok_embeds.float().norm(dim=-1)[attn.bool()].mean())
     out_norm = getattr(resampler, "output_norm", None)
@@ -877,6 +902,8 @@ def main():
     if args.overfit is None and _rotating(args.ckpt_dir):
         require_strip_think_match(_rotating(args.ckpt_dir)[-1], args.strip_think,
                                   escape_flag=None)
+        require_task_stream_match(_rotating(args.ckpt_dir)[-1], args.task_stream)
+    print(f"resampler task stream: {args.task_stream}")
 
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; training needs GPUs")

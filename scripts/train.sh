@@ -30,7 +30,30 @@
 #   sbatch scripts/train.sh
 # Each run gets its own checkpoint directory (RUN=run2 by default):
 #   RUN=run3 sbatch scripts/train.sh
+#
+# TASK_STREAM picks what the resampler's second stream reads (--task-stream, default
+# prompt): prompt-and-target, question (the question paraphrase alone, no patient
+# context) or none (no text). The LLM's input is the same under all four. A
+# non-default value is tagged into the default checkpoint dir -- run3_question,
+# run3_notext, run3_withtarget -- so a run never auto-resumes another stream's
+# checkpoints (train.py refuses that resume anyway, after the module load):
+#   RUN=run3 TASK_STREAM=question sbatch scripts/train.sh
 set -euo pipefail
+
+# --- which task stream -------------------------------------------------------
+# Read and checked here, before the module load: a variable no script reads is
+# ignored by bash, and an unknown value should fail in a second, not after the 14B.
+TASK_STREAM="${TASK_STREAM:-prompt}"
+case "$TASK_STREAM" in
+    prompt)            STREAM_TAG="" ;;
+    prompt-and-target) STREAM_TAG="_withtarget" ;;
+    question)          STREAM_TAG="_question" ;;
+    none)              STREAM_TAG="_notext" ;;
+    *)
+        echo "TASK_STREAM must be prompt, prompt-and-target, question or none," \
+             "got '$TASK_STREAM'" >&2
+        exit 2 ;;
+esac
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
@@ -62,20 +85,21 @@ EPOCHS="${EPOCHS:-10}"
 # resampler gained an input and an output LayerNorm, so a strict load fails).
 # Run 1 lives in the flat .../checkpoints; point CKPT_DIR there to evaluate it.
 RUN="${RUN:-run2}"
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN$STREAM_TAG}"
 
 source "$VENV/bin/activate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1   # no network on compute nodes
 mkdir -p "$CKPT_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
-echo "host: $(hostname)   model: $MODEL_DIR   run: $RUN   ckpt: $CKPT_DIR"
+echo "host: $(hostname)   model: $MODEL_DIR   run: $RUN   task_stream: $TASK_STREAM   ckpt: $CKPT_DIR"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 # Full run. Auto-resumes from the latest checkpoint in CKPT_DIR if one exists.
 srun python scripts/train.py \
     --model-dir "$MODEL_DIR" \
     --ckpt-dir "$CKPT_DIR" \
+    --task-stream "$TASK_STREAM" \
     --batch-size 4 \
     --epochs "$EPOCHS" \
     --ckpt-every 1000 \

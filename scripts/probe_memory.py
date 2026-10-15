@@ -49,7 +49,7 @@ from src.data.dataset import (  # noqa: E402
     DatasetConfig,
     build_datasets,
     make_collate_fn,
-    prompt_only_task_mask,
+    task_stream_ids,
 )
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 
@@ -159,9 +159,13 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
                             the target names the answer, so the resampler can encode
                             a label it will not have at inference. Kept for
                             comparison against that run, not as a default.
+        "question"          a separate tokenisation of the question paraphrase alone,
+                            no patient context ("Question: ...\nAnswer:").
+        "none"              no text at all: the zero-text ablation.
 
-    ``input_ids`` is untouched either way: the LLM still sees prompt + target + EOS
-    and ``labels`` still supervises the target positions alone.
+    src.data.dataset.task_stream_ids turns the mode into the stream's ids and mask.
+    ``input_ids`` is untouched under every mode: the LLM still sees prompt + target
+    + EOS and ``labels`` still supervises the target positions alone.
 
     ``loss_on`` selects which of those target positions contribute:
 
@@ -181,8 +185,8 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
     input_ids = batch["input_ids"].to(dev)
     attn = batch["attention_mask"].to(dev)
     labels = batch["labels"].to(dev)
-    task_mask = (prompt_only_task_mask(attn, labels) if task_stream == "prompt"
-                 else attn.bool())
+    task_ids, task_mask = task_stream_ids(batch, task_stream)
+    task_ids, task_mask = task_ids.to(dev), task_mask.to(dev)
     if loss_on == "decision":
         labels = labels.masked_fill(~batch["decision_mask"].to(dev), -100)
         # The mean below is over supervised positions, so a row with none would
@@ -197,7 +201,8 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         tok_embeds = model.get_input_embeddings()(input_ids)          # (B, L, 5120)
-        latents = resampler(ecg, task_embeddings=tok_embeds, task_mask=task_mask)
+        latents = resampler(ecg, task_embeddings=model.get_input_embeddings()(task_ids),
+                            task_mask=task_mask)
         B, Lq, _ = latents.shape
 
         # The latents are the prefix; the spliced tensor must carry their grad

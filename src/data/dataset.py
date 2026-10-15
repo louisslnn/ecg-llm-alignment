@@ -13,6 +13,8 @@ What one example carries:
                     nothing the teacher saw -- no report, no SCP statements, no
                     annotations. This is the whole point: the student must recover
                     the answer from the signal, not read it off the labels.
+  * ``question``    the paraphrase alone, no patient context: what the RESAMPLER's
+                    task stream reads under --task-stream question.
   * ``target``      the teacher's Evidence/Reasoning/Conclusion text for that
                     superclass, taken verbatim from ``parsed_final`` (the parse of
                     the report-reference-rewritten ``final_content``; never
@@ -394,6 +396,7 @@ class ECGSuperclassDataset(Dataset):
             "task_prompt": student_prompt(
                 ex.ecg_id, ex.superclass, rec.get("age"), rec.get("sex")
             ),
+            "question": render_question(ex.ecg_id, ex.superclass),
             "target": ex.target,
             "label": ex.label,
             "ecg_id": ex.ecg_id,
@@ -463,7 +466,73 @@ def _format_prompt(tokenizer, user_content: str, strip_think: bool = True) -> st
     return f"<|user|>\n{user_content}\n<|assistant|>\n"
 
 
-TASK_STREAM_MODES = ("prompt", "prompt-and-target")
+# What the RESAMPLER's second (task-text) stream reads. The LLM's input is the same
+# under all four; only the resampler's view changes. See :func:`task_stream_ids`.
+TASK_STREAM_MODES = ("prompt", "prompt-and-target", "question", "none")
+
+
+def resampler_question_text(question: str) -> str:
+    """The text the resampler reads under --task-stream question.
+
+    The question paraphrase alone, framed as chathealthAI_train.py:1406 frames it
+    (``resampler_prompt_text = f"Question: {instruction}\nAnswer:"``), while the LLM
+    keeps the full chat prompt. No patient context and no chat template: the
+    "prompt" stream is cut out of the LLM's own input_ids, which is how age and sex
+    reached the resampler, and this is a separate tokenisation precisely so that
+    they do not.
+    """
+    return f"Question: {question}\nAnswer:"
+
+
+def question_stream_tensors(tokenizer, questions: Sequence[str], pad_id: int):
+    """``(task_input_ids, task_attention_mask)`` for a batch of questions.
+
+    Tokenised without special tokens, as every other piece of text here is: a BOS
+    in the stream would be one more position identical across examples. Right-
+    padded; the mask is the only thing the resampler reads positions by, so the
+    padding side does not matter to it.
+    """
+    ids_list = [tokenizer(resampler_question_text(q), add_special_tokens=False).input_ids
+                for q in questions]
+    width = max(len(x) for x in ids_list)
+    ids = torch.full((len(ids_list), width), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(ids_list), width), dtype=torch.long)
+    for i, row in enumerate(ids_list):
+        ids[i, :len(row)] = torch.tensor(row, dtype=torch.long)
+        mask[i, :len(row)] = 1
+    return ids, mask
+
+
+def task_stream_ids(batch: Dict[str, Any], mode: str):
+    """``(ids, mask)``: the tokens the resampler's task stream embeds, and which of
+    them it may read (True = attend). The one place a mode becomes tensors; every
+    resampler call in training, the gate and evaluation goes through here.
+
+        prompt             the LLM's own input_ids, restricted to the prompt by
+                           :func:`prompt_only_task_mask`. Patient age and sex are in
+                           the prompt, so they are in this stream.
+        prompt-and-target  the LLM's input_ids, every real token: the target, and
+                           the answer it spells out, included. Run 1's stream.
+        question           a SEPARATE tokenisation, ``task_input_ids``: the question
+                           paraphrase framed by :func:`resampler_question_text`.
+                           Nothing else -- no template, no patient context.
+        none               zero tokens: the zero-text ablation. The latents' second
+                           cross-attention then reads only the latents themselves.
+
+    A batch from the generation collate has no ``labels``; its input_ids are the
+    prompt and nothing else, so ``prompt`` and ``prompt-and-target`` are both the
+    whole of them there -- there is no target at inference to include.
+    """
+    if mode not in TASK_STREAM_MODES:
+        raise ValueError(f"unknown task stream {mode!r}; have {TASK_STREAM_MODES}")
+    if mode == "question":
+        return batch["task_input_ids"], batch["task_attention_mask"].bool()
+    ids, attn = batch["input_ids"], batch["attention_mask"]
+    if mode == "none":
+        return ids[:, :0], attn[:, :0].bool()
+    if mode == "prompt" and "labels" in batch:
+        return ids, prompt_only_task_mask(attn, batch["labels"])
+    return ids, attn.bool()
 
 
 def prompt_only_task_mask(
@@ -520,6 +589,10 @@ def make_collate_fn(
     (and padding) are masked to -100 in ``labels`` so the LM loss lands only on the
     target. Right-padded. The resampler latents are NOT prepended here -- the
     training step splices them into the embeddings.
+
+    It also carries ``task_input_ids`` / ``task_attention_mask``, the question
+    stream (:func:`question_stream_tensors`), whatever the task stream: which one
+    the resampler reads is :func:`task_stream_ids`'s decision, not the collate's.
     """
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
@@ -555,11 +628,15 @@ def make_collate_fn(
             labels[i, :n] = torch.tensor(lbl, dtype=torch.long)
             attention_mask[i, :n] = 1
 
+        task_input_ids, task_attention_mask = question_stream_tensors(
+            tokenizer, [b["question"] for b in batch], pad_id)
         return {
             "ecg_embed": ecg_embed,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "task_input_ids": task_input_ids,
+            "task_attention_mask": task_attention_mask,
             "head_label": torch.tensor(
                 [float(b["label"]) for b in batch], dtype=torch.float32
             ),

@@ -47,14 +47,20 @@
 #                               three Yes and three No (--overfit-select; default
 #                               head, the first 50 examples, where all ten records
 #                               are normal and the answer follows from the question).
-# Either one moves the default CKPT_DIR (overfit_gate_decision, overfit_gate_stratified,
-# overfit_gate_decision_stratified): every gate writes the same file names, and a
-# different experiment must not land on the baseline's records and overfit_final.pt.
+#   TASK_STREAM=question        what the resampler's second stream reads
+#                               (--task-stream; default prompt): prompt-and-target,
+#                               question (the paraphrase alone, no patient
+#                               context) or none (no text).
+# Each one moves the default CKPT_DIR (overfit_gate_decision, overfit_gate_stratified,
+# overfit_gate_question, ...; TASK_STREAM tags as _withtarget, _question, _notext):
+# every gate writes the same file names, and a different experiment must not land
+# on the baseline's records and overfit_final.pt.
 #
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 # Submit from the repo root after `mkdir -p logs`:
 #   sbatch scripts/train_overfit.sh
 #   LOSS_ON=decision OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
+#   TASK_STREAM=question OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
 set -euo pipefail
 
 # --- which gate --------------------------------------------------------------
@@ -68,11 +74,23 @@ esac
 case "$OVERFIT_SELECT" in head|stratified) ;; *)
     echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
 esac
+TASK_STREAM="${TASK_STREAM:-prompt}"
+case "$TASK_STREAM" in
+    prompt)            STREAM_TAG="" ;;
+    prompt-and-target) STREAM_TAG="_withtarget" ;;
+    question)          STREAM_TAG="_question" ;;
+    none)              STREAM_TAG="_notext" ;;
+    *)
+        echo "TASK_STREAM must be prompt, prompt-and-target, question or none," \
+             "got '$TASK_STREAM'" >&2
+        exit 2 ;;
+esac
 # Named into the default checkpoint dir below, and only when not the default, so
 # the baseline gate keeps the directory it has always had.
 GATE_TAG=""
 [[ "$LOSS_ON" == "all" ]] || GATE_TAG+="_$LOSS_ON"
 [[ "$OVERFIT_SELECT" == "head" ]] || GATE_TAG+="_$OVERFIT_SELECT"
+GATE_TAG+="$STREAM_TAG"
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
@@ -103,7 +121,7 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 mkdir -p "$CKPT_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
-echo "host: $(hostname)   model: $MODEL_DIR   loss_on: $LOSS_ON   overfit_select: $OVERFIT_SELECT"
+echo "host: $(hostname)   model: $MODEL_DIR   loss_on: $LOSS_ON   overfit_select: $OVERFIT_SELECT   task_stream: $TASK_STREAM"
 echo "ckpt: $CKPT_DIR"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
@@ -113,6 +131,7 @@ srun python scripts/train.py \
     --overfit 50 \
     --overfit-select "$OVERFIT_SELECT" \
     --loss-on "$LOSS_ON" \
+    --task-stream "$TASK_STREAM" \
     --batch-size 4 \
     --overfit-target-loss 0.05 \
     --overfit-max-steps 3000

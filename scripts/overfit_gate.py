@@ -556,7 +556,7 @@ def run_gate(model, resampler, tokenizer, dataset, indices, args) -> bool:
         ctx, dataset, indices, os.path.join(args.ckpt_dir, "gate_generations.jsonl"),
         split="train", seed=args.seed, num_workers=args.num_workers,
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS, batch_size=1, print_first=3,
-        log_every=10, **real)
+        log_every=10, task_stream=args.task_stream, **real)
 
     targets = [dataset.examples[i].target for i in indices]
     located = locate_decision_tokens(tokenizer, targets, tf_records)

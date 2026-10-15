@@ -81,6 +81,7 @@ from evaluate import (  # noqa: E402
     load_split,
     print_metrics,
     print_teacher_forced,
+    resolve_task_stream,
     run_generation,
     run_teacher_forced,
     summarise_teacher_forced,
@@ -157,14 +158,14 @@ def parse_args():
     ap.add_argument("--print-first", type=int, default=1,
                     help="print the first N generations of each condition in full")
     ap.add_argument("--log-every", type=int, default=25)
-    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default="prompt",
-                    help="what the RESAMPLER's task-text stream may read in the "
-                         "teacher-forced sweep. 'prompt' (default) is the real prompt "
-                         "tokens only; 'prompt-and-target' reproduces run 1 and is "
-                         "what produced the contaminated reference numbers. "
-                         "Generation is prompt-only either way -- its input_ids are "
-                         "the prompt -- so this flag moves the teacher-forced columns "
-                         "alone")
+    ap.add_argument("--task-stream", choices=TASK_STREAM_MODES, default=None,
+                    help="what the RESAMPLER's task-text stream reads, in both "
+                         "sweeps. Default: the mode the checkpoint recorded, or "
+                         "'prompt' for one that predates the record. "
+                         "'prompt-and-target' reproduces run 1 and is what produced "
+                         "the contaminated reference numbers; generation has no "
+                         "target, so there it reads the prompt. 'question' is the "
+                         "question paraphrase alone, 'none' no text")
     ap.add_argument("--skip-teacher-forced", action="store_true")
     ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
                     default=DatasetConfig.strip_think,
@@ -360,7 +361,7 @@ def print_teacher_forced_comparison(tf_summaries, task_stream):
 
     if warning:
         print(f"  WARNING: {warning}")
-    if task_stream != "prompt":
+    if task_stream == "prompt-and-target":
         print("  NOTE: this run used the same contaminated stream as the reference, so")
         print("        the two blocks should agree; treat a difference as a change in")
         print("        the data or the checkpoint, not as a finding about the ECG.")
@@ -449,6 +450,7 @@ def main():
     args = parse_args()
     data_cfg = build_data_config(args)
     preflight(args, data_cfg)
+    args.task_stream = resolve_task_stream(args.ckpt, args.task_stream)
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; this sweep needs GPUs")
     print(f"visible GPUs: {torch.cuda.device_count()}")
@@ -489,7 +491,7 @@ def main():
             shuffled=opts["shuffled"], zero_latents=opts["zero_latents"],
             max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
             num_workers=args.num_workers, print_first=args.print_first,
-            log_every=args.log_every,
+            log_every=args.log_every, task_stream=args.task_stream,
         )
         by_condition[name] = records
 
