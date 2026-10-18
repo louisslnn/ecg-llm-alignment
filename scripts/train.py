@@ -25,10 +25,17 @@ best.pt (lowest val loss) are kept.
     # target). Prompt, prefix, task stream and tokenisation are identical; only
     # which target positions contribute changes. Every loss this mode logs is the
     # decision-token mean and is labelled so, the stop rule measures that token per
-    # label, the gate is judged on condition 3 alone, and the real/shuffled/zeroed
-    # controls are reported at that token, split by label. Give it its own
-    # --ckpt-dir: it writes the same file names as any other gate run.
-    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --loss-on decision
+    # label, the real/shuffled/zeroed controls are reported at that token, split by
+    # label, and the gate is judged on condition 4 alone: the decision token after
+    # the prompt and "Conclusion:" with no target prose, which must be low under the
+    # real ECG and at least 0.5 nats higher under a donor ECG that answers the other
+    # way. It needs the stratified set (below): on the head set every record
+    # answers every question the same way, and the controls cannot show anything.
+    # The free-generation pass is skipped, since condition 2 is not judged here
+    # (--no-skip-generation to run it). Give it its own --ckpt-dir: it writes the
+    # same file names as any other gate run.
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --loss-on decision \
+        --overfit-select stratified
 
     # the same gate on records drawn so that every superclass has at least three
     # Yes and three No among them (--overfit-select stratified; the default, head,
@@ -205,6 +212,14 @@ def parse_args():
                          "conditions; see scripts/overfit_gate.py for the other two. "
                          "Under --loss-on decision this condition is printed against "
                          "the threshold but not judged")
+    ap.add_argument("--skip-generation", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="skip the gate's free-generation pass, condition 2. ON by "
+                         "default under --loss-on decision, where nothing supervises "
+                         "the prose, condition 2 is not judged, and the pass is most "
+                         "of the gate's time; --no-skip-generation runs it anyway. "
+                         "OFF otherwise, and refused under --loss-on all, where "
+                         "condition 2 is judged and the gate could not pass without it")
     # data path overrides (default to DatasetConfig)
     ap.add_argument("--emb-cache", default=None)
     ap.add_argument("--manifest", default=None)
@@ -232,6 +247,24 @@ def parse_args():
                  "same quantity the gate's first condition checks")
     if args.overfit_eval_every < 1:
         ap.error("--overfit-eval-every must be at least 1")
+    # On the head set all ten records are normal: every question has one answer
+    # across the set, so condition 4's shuffled column and donor rows cannot show
+    # anything, and its verdict would be meaningless rather than merely weak.
+    if (args.overfit is not None and args.loss_on == "decision"
+            and args.overfit_select == "head"):
+        ap.error("--loss-on decision cannot run with --overfit-select head (the "
+                 "default): all ten head records answer each question the same way, "
+                 "so condition 4's shuffled column and donor-answers-opposite rows "
+                 "cannot show anything and its verdict would be meaningless. Pass "
+                 "--overfit-select stratified")
+    if args.skip_generation is None:
+        args.skip_generation = args.overfit is not None and args.loss_on == "decision"
+    elif args.skip_generation and args.overfit is None:
+        ap.error("--skip-generation skips a pass of the --overfit gate; without "
+                 "--overfit N it would be silently ignored")
+    elif args.skip_generation and args.loss_on == "all":
+        ap.error("--skip-generation is refused under --loss-on all: condition 2, free "
+                 "generation, is judged there, and the gate cannot pass without it")
     if args.overfit_select == "stratified":
         # The unit is a record with its five questions, and three Yes plus three No
         # for one superclass already takes six records.
@@ -975,17 +1008,21 @@ def main():
         # A write that fails (scratch quota) is said on the closing line and does not
         # touch the exit code: that is the gate's verdict, and an uncaught error here
         # would exit 1 on a gate that passed.
-        verdict = f"gate {'PASSED' if ok else 'FAILED'}"
+        # None is condition 4 not judged (too few donor-answers-opposite examples):
+        # not a pass, so it exits 1 and is saved as gate_passed False, but it is
+        # not called a failure either.
+        verdict = {True: "gate PASSED", False: "gate FAILED", None: "gate NOT JUDGED"}[ok]
         try:
             path = save_overfit_final(args.ckpt_dir, resampler,
-                                      steps // len(train_loader), steps, ok, args)
+                                      steps // len(train_loader), steps, ok is True,
+                                      args)
         except (OSError, RuntimeError) as err:
             print(f"{verdict}; the resampler it judged (step {steps}) was NOT saved to "
                   f"{os.path.join(args.ckpt_dir, OVERFIT_FINAL)}: {err}", flush=True)
         else:
             print(f"{verdict}; the resampler it judged (step {steps}) is in {path}",
                   flush=True)
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if ok is True else 1)
 
     start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer,
                                                 dev, args.loss_on)

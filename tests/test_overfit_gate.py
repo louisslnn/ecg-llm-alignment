@@ -39,10 +39,30 @@ def _records(n_pos=10, loss=0.04, closed=N, gen_len=TARGET_LEN, matched=N):
     return tf, gen
 
 
-def _verdict(capsys, decision=None, threshold=0.1, loss_on="all", **kw):
+def _no_context(tf, real=0.03, shuffled=1.0, donor_labels=None):
+    """Condition 4's inputs for ``tf``: real and shuffled no-context records, and the
+    donor's answer per example (by default the opposite of every label, so both
+    donor-answers-opposite rows are as full as the labels allow). ``real`` and
+    ``shuffled`` are one loss for every example or a list of them."""
+    def recs(loss, p_yes):
+        losses = loss if isinstance(loss, list) else [loss] * len(tf)
+        return [{"ecg_id": r["ecg_id"], "superclass": r["superclass"], "loss": v,
+                 "p_yes": p_yes(r)} for r, v in zip(tf, losses)]
+    return ({"real": recs(real, lambda r: 0.9 if r["label"] else 0.1),
+             "shuffled": recs(shuffled, lambda r: 0.5)},
+            donor_labels if donor_labels is not None else [not r["label"] for r in tf])
+
+
+def _verdict(capsys, decision=None, threshold=0.1, loss_on="all", nc=None, **kw):
+    """The closing line. Under decision, condition 4 passes unless ``nc`` (a
+    ``_no_context`` pair) says otherwise."""
     tf, gen = _records(**kw)
     decision = decision or [0.01] * N
-    ok = gate_verdict(tf, gen, decision, [TARGET_LEN] * N, threshold, loss_on=loss_on)
+    if nc is None and loss_on == "decision":
+        nc = _no_context(tf)
+    no_context, donors = nc or (None, None)
+    ok = gate_verdict(tf, gen, decision, [TARGET_LEN] * N, threshold, loss_on=loss_on,
+                      no_context=no_context, donor_labels=donors)
     return ok, capsys.readouterr().out.strip().splitlines()[-1]
 
 
@@ -359,37 +379,112 @@ def test_under_loss_on_all_the_closing_line_is_what_it_always_was(capsys):
     assert "condition 1" in last and "condition 2" in last
 
 
-def test_decision_mode_is_judged_on_condition_3_alone_and_says_so(capsys):
+def test_decision_mode_is_judged_on_condition_4_alone_and_says_so(capsys):
     ok, last = _verdict(capsys, loss_on="decision", **PROSE_UNTRAINED)
-    assert ok and last.startswith("GATE PASSED: condition 3 met")
-    assert "--loss-on decision rule: judged on condition 3 alone" in last
+    assert ok is True and last.startswith("GATE PASSED: condition 4 met")
+    assert "--loss-on decision rule: judged on condition 4 alone" in last
 
-    # condition 3 still fails per label, and nothing else is named as a failure
-    decision = [0.001] * 45 + [0.5] * 5
-    ok, last = _verdict(capsys, loss_on="decision", decision=decision, n_pos=45,
+    # condition 3 failing per label is printed, not judged: the token is readable
+    # off the teacher-forced prose, so it says nothing about the ECG
+    decision = [0.001] * 25 + [0.5] * 25
+    ok, last = _verdict(capsys, loss_on="decision", decision=decision, n_pos=25,
                         **PROSE_UNTRAINED)
-    assert not ok and last.startswith("GATE FAILED: condition 3")
-    assert "label=False" in last and "label=True" not in last
+    assert ok is True and "condition 3" not in last.split("[")[0]
+
+    # and passing conditions 1-3 does not rescue a failed condition 4
+    tf, _ = _records()
+    ok, last = _verdict(capsys, loss_on="decision", nc=_no_context(tf, real=0.5))
+    assert ok is False and last.startswith("GATE FAILED: condition 4")
+    assert "(a) real, label=True" in last and "(a) real, label=False" in last
+    assert "(b)" not in last
     assert "closed with <END>" not in last and "mean over examples" not in last
-    assert "--loss-on decision rule: judged on condition 3 alone" in last
-
-    # passing conditions 1 and 2 does not rescue a failed condition 3
-    ok, _ = _verdict(capsys, loss_on="decision", decision=decision, n_pos=45)
-    assert not ok
+    assert "--loss-on decision rule: judged on condition 4 alone" in last
 
 
-def test_decision_mode_still_prints_all_three_conditions_with_thresholds(capsys):
+def test_decision_mode_still_prints_every_condition_with_thresholds(capsys):
     tf, gen = _records(**PROSE_UNTRAINED)
-    gate_verdict(tf, gen, [0.01] * N, [TARGET_LEN] * N, 0.1, loss_on="decision")
+    no_context, donors = _no_context(tf)
+    gate_verdict(tf, gen, [0.5] * N, [TARGET_LEN] * N, 0.1, loss_on="decision",
+                 no_context=no_context, donor_labels=donors)
     lines = capsys.readouterr().out.splitlines()
     out = "\n".join(lines)
-    assert out.count("need < 0.1") == 3 and out.count("need >= 90%") == 2
-    assert out.count("need within 25%") == 1
-    # the four rows of conditions 1 and 2 keep their result and are marked; the two
-    # of condition 3 are the only ones that read as a verdict
-    assert sum(line.endswith("FAIL  (not judged)") for line in lines) == 4
-    assert sum(line.endswith("PASS") for line in lines) == 2
-    assert sum("NOT judged under --loss-on decision" in line for line in lines) == 2
+    # 1, the two labels of 3, and the two labels of 4 (a)
+    assert out.count("need < 0.1") == 5 and out.count("need >= 90%") == 2
+    assert out.count("need within 25%") == 1 and out.count("need >= 0.5 nats") == 2
+    # the six rows of conditions 1-3 keep their result and are marked; the four of
+    # condition 4 are the only ones that read as a verdict
+    assert sum(line.endswith("FAIL  (not judged)") for line in lines) == 6
+    assert sum(line.endswith("PASS") for line in lines) == 4
+    assert sum("NOT judged under --loss-on decision" in line for line in lines) == 3
+    # condition 3 says why it is not judged
+    why = out.split("3. decision-token loss")[1].split("4. decision token")[0]
+    assert "why not judged" in why and "0.018" in why and "Conclusion:" in why
+
+
+def test_condition_4_b_is_the_shuffled_gap_on_the_donor_answers_opposite_rows(capsys):
+    tf, _ = _records(n_pos=20)              # 20 label=True, 30 label=False
+    labels = [r["label"] for r in tf]
+
+    def last(real, shuffled, donors=None):
+        return _verdict(capsys, loss_on="decision", n_pos=20,
+                        nc=_no_context(tf, real, shuffled, donors))
+
+    # a gap of exactly 0.5 passes; just under fails, and names the row
+    assert last(0.05, 0.55)[0] is True
+    ok, line = last(0.05, 0.54)
+    assert ok is False and "(b) label=True, donor No (n 20)" in line
+    assert "(b) label=False, donor Yes (n 30)" in line
+    assert "(a)" not in line
+
+    # (b) is read only where the donor answers the other way: the examples whose
+    # donor agrees can lose nothing under the shuffle and must not dilute the gap
+    # (half of each label's donors agree here, leaving 10 and 15 on the rows)
+    donors = [not label if i % 2 == 0 else label for i, label in enumerate(labels)]
+    shuffled = [3.0 if d != label else 0.05 for d, label in zip(donors, labels)]
+    ok, line = last(0.05, shuffled, donors)
+    assert ok is True and line.startswith("GATE PASSED: condition 4 met")
+
+    # each row on its own: a big gap on label=False does not carry label=True
+    shuffled = [0.1 if label else 3.0 for label in labels]
+    ok, line = last(0.05, shuffled)
+    assert ok is False and "label=True, donor No" in line and "label=False" not in line
+
+
+def test_condition_4_with_a_thin_donor_row_is_not_judged_and_says_so(capsys):
+    tf, _ = _records()
+    labels = [r["label"] for r in tf]
+    # 7 of the 10 label=True examples get a donor that answers No: one short
+    donors = [(not label) if (not label or i < 7) else label
+              for i, label in enumerate(labels)]
+    for real, shuffled in ((0.03, 3.0), (0.5, 0.5)):     # would pass; would fail
+        ok, line = _verdict(capsys, loss_on="decision",
+                            nc=_no_context(tf, real, shuffled, donors))
+        assert ok is None
+        assert line.startswith("GATE NOT JUDGED: condition 4 needs at least 8")
+        assert "label=True donor No n 7" in line and "label=False" not in line
+        assert "PASSED" not in line and "FAILED" not in line
+    # at exactly 8 it is judged
+    donors[7] = False
+    assert _verdict(capsys, loss_on="decision",
+                    nc=_no_context(tf, 0.03, 3.0, donors))[0] is True
+    # no shuffled pass at all (a single-record set) is the thinnest row there is
+    no_context, donors = _no_context(tf)
+    del no_context["shuffled"]
+    ok, line = _verdict(capsys, loss_on="decision", nc=(no_context, donors))
+    assert ok is None and "n 0" in line
+
+
+def test_decision_mode_needs_condition_4s_real_pass(capsys):
+    import pytest
+
+    tf, gen = _records()
+    with pytest.raises(ValueError, match="no-context pass is missing"):
+        gate_verdict(tf, gen, [0.01] * N, [TARGET_LEN] * N, 0.1, loss_on="decision")
+    no_context, donors = _no_context(tf)
+    no_context["shuffled"] = no_context["shuffled"][::-1]
+    with pytest.raises(ValueError, match="different examples"):
+        gate_verdict(tf, gen, [0.01] * N, [TARGET_LEN] * N, 0.1, loss_on="decision",
+                     no_context=no_context, donor_labels=donors)
 
 
 def test_loss_on_flag_defaults_to_all_and_moves_the_stop_target_check(monkeypatch):
@@ -399,19 +494,78 @@ def test_loss_on_flag_defaults_to_all_and_moves_the_stop_target_check(monkeypatc
     assert _train_args(monkeypatch, "--loss-on", "decision").loss_on == "decision"
     with pytest.raises(SystemExit):
         _train_args(monkeypatch, "--loss-on", "prose")
+    strat = ("--overfit-select", "stratified")
     # under decision the loop stops on condition 3's quantity, so the target is
     # held below THAT threshold (0.1) wherever --gate-threshold has been moved to
     for gate_threshold in ("0.1", "5"):
         with pytest.raises(SystemExit):
-            _train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision",
+            _train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision", *strat,
                         "--gate-threshold", gate_threshold,
                         "--overfit-target-loss", "0.2")
-    _train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision",
+    _train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision", *strat,
                 "--gate-threshold", "0.01")
-    # and the hyperparameters are the ones --loss-on all runs with
-    a = vars(_train_args(monkeypatch, "--overfit", "50"))
-    b = vars(_train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision"))
-    assert {k for k in a if a[k] != b[k]} == {"loss_on"}
+    # and the hyperparameters are the ones --loss-on all runs with; the generation
+    # pass is the one other difference, and only because condition 2 is not judged
+    a = vars(_train_args(monkeypatch, "--overfit", "50", *strat))
+    b = vars(_train_args(monkeypatch, "--overfit", "50", "--loss-on", "decision", *strat))
+    assert {k for k in a if a[k] != b[k]} == {"loss_on", "skip_generation"}
+
+
+def test_decision_on_the_head_set_is_refused_at_parse_time(monkeypatch, capsys):
+    import pytest
+
+    for argv in (("--overfit", "50", "--loss-on", "decision"),
+                 ("--overfit", "50", "--loss-on", "decision", "--overfit-select", "head")):
+        with pytest.raises(SystemExit):
+            _train_args(monkeypatch, *argv)
+        err = capsys.readouterr().err
+        assert "--loss-on decision cannot run with --overfit-select head" in err
+        assert "condition 4" in err and "Pass --overfit-select stratified" in err
+    # outside the gate there is no head set to refuse
+    assert _train_args(monkeypatch, "--loss-on", "decision").overfit_select == "head"
+
+
+def test_skip_generation_defaults_on_under_decision_only(monkeypatch, capsys):
+    import pytest
+
+    strat = ("--overfit", "50", "--overfit-select", "stratified")
+    assert _train_args(monkeypatch, *strat).skip_generation is False
+    assert _train_args(monkeypatch).skip_generation is False
+    assert _train_args(monkeypatch, *strat, "--loss-on", "decision").skip_generation is True
+    assert _train_args(monkeypatch, *strat, "--loss-on", "decision",
+                       "--no-skip-generation").skip_generation is False
+    with pytest.raises(SystemExit):                 # condition 2 is judged there
+        _train_args(monkeypatch, *strat, "--skip-generation")
+    assert "refused under --loss-on all" in capsys.readouterr().err
+    with pytest.raises(SystemExit):                 # nothing to skip without the gate
+        _train_args(monkeypatch, "--loss-on", "decision", "--skip-generation")
+    assert "without --overfit N" in capsys.readouterr().err
+
+
+def test_a_skipped_generation_pass_is_printed_as_not_run(capsys):
+    import pytest
+
+    tf, _ = _records(**PROSE_UNTRAINED)
+    no_context, donors = _no_context(tf)
+
+    def run(nc_real=0.03):
+        nc, d = _no_context(tf, real=nc_real)
+        return gate_verdict(tf, None, [0.01] * N, [TARGET_LEN] * N, 0.1,
+                            loss_on="decision", no_context=nc, donor_labels=d)
+
+    ok = run()
+    out = capsys.readouterr().out
+    assert ok is True
+    assert "2. free generation   [not run, NOT judged under --loss-on decision]" in out
+    assert "not run (--skip-generation)" in out
+    assert "FAIL" not in out.split("2. free generation")[1].split("3. ")[0]
+    assert "condition 2 was not run (--skip-generation)" in out.splitlines()[-1]
+    # a failing condition 4 still fails, skipped pass or not
+    assert run(nc_real=0.5) is False
+    capsys.readouterr()
+    with pytest.raises(ValueError, match="condition 2 is judged"):
+        gate_verdict(tf, None, [0.01] * N, [TARGET_LEN] * N, 0.1, loss_on="all",
+                     no_context=no_context, donor_labels=donors)
 
 
 def _decision_setup(n=10):
@@ -684,3 +838,112 @@ def test_donor_answers_are_the_donor_records_own_labels(capsys):
         in capsys.readouterr().out
     print_decision_controls(dec, labels, [not a for a in answers])
     assert "NO example was served" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Condition 4: the decision token with no target context.                      #
+# --------------------------------------------------------------------------- #
+
+def _stub_ctx():
+    import torch
+    from evaluate import EvalContext
+    from src.data.dataset import DatasetConfig, load_student_tokenizer
+    from src.model.resampler import PerceiverResamplerConfig, Resampler
+    from tests.test_task_stream import _StubStudent
+
+    tok = load_student_tokenizer(DatasetConfig(debug=True))
+    cfg = PerceiverResamplerConfig.debug()
+    torch.manual_seed(0)
+    return EvalContext(model=_StubStudent(len(tok), cfg.embed_dim).eval(),
+                       resampler=Resampler(cfg).eval(), tokenizer=tok,
+                       dev=torch.device("cpu"), eos_id=tok.eos_token_id,
+                       pad_id=tok.pad_token_id, yes_pos=[], no_pos=[], capture=None,
+                       processors=None)
+
+
+def test_the_no_context_text_is_the_marker_and_the_token_condition_3_scores():
+    from overfit_gate import no_context_text
+    from src.data.dataset import DatasetConfig, load_student_tokenizer
+    from yn_token_loss import decision_index, tokenise_target
+
+    tok = load_student_tokenizer(DatasetConfig(debug=True))
+    for e in _debug_train().examples[:100]:
+        context, decision_id, why = no_context_text(tok, e.target)
+        assert why is None, why
+        assert context == "Conclusion:"
+        ids, offsets = tokenise_target(tok, e.target)
+        assert decision_id == ids[decision_index(e.target, offsets)[0]]
+        assert tok.decode([decision_id]).strip() == ("Yes" if e.label else "No")
+
+    # a target the locator cannot place is reported, not guessed at
+    assert no_context_text(tok, "Step 1: ...\nno marker here")[2] is not None
+
+
+def test_the_no_context_probe_reads_no_prose_and_scores_the_same_position(tmp_path):
+    """Against teacher forcing on a target cut to "Conclusion: Yes|No": the same
+    position, reached by another code path, gives the same loss."""
+    import json
+    import types
+
+    import torch
+    from evaluate import teacher_forced_batch
+    from overfit_gate import no_context_pass, shuffle_within
+    from src.data.dataset import make_collate_fn
+    from yn_token_loss import MARKER, decision_index, tokenise_target
+
+    dataset, ctx = _debug_train(), _stub_ctx()
+    tok = ctx.tokenizer
+    indices = list(range(10))
+    for stream in ("prompt", "question"):
+        args = types.SimpleNamespace(batch_size=4, max_length=2048, seed=0,
+                                     task_stream=stream, ckpt_dir=str(tmp_path))
+        real = no_context_pass(ctx, dataset, indices, args, "real",
+                               shuffled=False, zero_latents=False)
+        assert [(r["ecg_id"], r["superclass"]) for r in real] == [
+            (dataset.examples[i].ecg_id, dataset.examples[i].superclass) for i in indices]
+        assert all(r["context"] == "Conclusion:" for r in real)
+        assert all(0.0 <= r["p_yes"] <= 1.0 for r in real)
+        assert [json.loads(line) for line in open(tmp_path / "gate_no_context_real.jsonl")] \
+            == real
+
+        # the target cut right after its decision token, teacher-forced
+        items = []
+        for i in indices:
+            it = dataset[i]
+            ids, offsets = tokenise_target(tok, it["target"])
+            k = decision_index(it["target"], offsets)[0]
+            items.append({**it, "target": it["target"][it["target"].index(MARKER):
+                                                       offsets[k][1]]})
+        tf = teacher_forced_batch(ctx.model, ctx.resampler,
+                                  make_collate_fn(tok, max_length=2048)(items),
+                                  ctx.dev, task_stream=stream)
+        n_ctx = len(tok("Conclusion:", add_special_tokens=False).input_ids)
+        for r, (_, _, pos) in zip(real, tf):
+            assert abs(r["loss"] - pos[n_ctx]) < 1e-3     # position_losses are 4 dp
+
+    view = shuffle_within(dataset, indices, 0)
+    shuffled = no_context_pass(ctx, view, indices, args, "shuffled",
+                               shuffled=True, zero_latents=False)
+    zeroed = no_context_pass(ctx, dataset, indices, args, "zeroed",
+                             shuffled=False, zero_latents=True)
+    assert all(r["donor_ecg_id"] == view.mapping[r["ecg_id"]] for r in shuffled)
+    for recs in (shuffled, zeroed):
+        assert [r["loss"] for r in recs] != [r["loss"] for r in real]
+
+
+def test_condition_4_is_left_out_under_loss_on_all(capsys):
+    tf, gen = _records()
+    ok = gate_verdict(tf, gen, [0.01] * N, [TARGET_LEN] * N, 0.1)
+    out = capsys.readouterr().out
+    assert ok is True and "4." not in "".join(line[:2] for line in out.splitlines())
+
+
+def test_the_no_context_auprc_is_read_against_the_positive_rate(capsys):
+    from overfit_gate import print_no_context_auprc
+
+    labels = [True, False, False, True, False]
+    ranked = [{"p_yes": p} for p in (0.9, 0.2, 0.1, 0.8, 0.3)]
+    backwards = [{"p_yes": 1 - r["p_yes"]} for r in ranked]
+    out = print_no_context_auprc({"real": ranked, "shuffled": backwards}, labels)
+    assert out["real"] == 1.0 and out["shuffled"] < 0.5
+    assert "positive rate 0.4000, the null" in capsys.readouterr().out

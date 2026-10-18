@@ -42,7 +42,10 @@
 # TWO OTHER GATES, each an env override; an unmodified submission is the gate above.
 #   LOSS_ON=decision            train on ONE position per example, the Yes/No token
 #                               after "Conclusion:" (--loss-on; default all). The
-#                               verdict is then condition 3 alone.
+#                               verdict is then condition 4 alone. Needs
+#                               OVERFIT_SELECT=stratified, and skips the free-
+#                               generation pass (condition 2, not judged here):
+#                               about 21 of the run's 25 minutes.
 #   OVERFIT_SELECT=stratified   draw the 10 records so every superclass has at least
 #                               three Yes and three No (--overfit-select; default
 #                               head, the first 50 examples, where all ten records
@@ -74,6 +77,14 @@ esac
 case "$OVERFIT_SELECT" in head|stratified) ;; *)
     echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
 esac
+# Caught again in train.py: --loss-on decision on the head set is refused, since
+# every head record answers each question the same way and the gate can then pass
+# on the question alone.
+if [[ "$LOSS_ON" == "decision" && "$OVERFIT_SELECT" == "head" ]]; then
+    echo "LOSS_ON=decision needs OVERFIT_SELECT=stratified: on the head set every" \
+         "record answers each question the same way" >&2
+    exit 2
+fi
 TASK_STREAM="${TASK_STREAM:-prompt}"
 case "$TASK_STREAM" in
     prompt)            STREAM_TAG="" ;;

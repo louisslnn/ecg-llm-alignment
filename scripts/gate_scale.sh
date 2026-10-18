@@ -46,21 +46,22 @@
 #
 # WHICH GATE, two env overrides; unset, the point is the one it has always been:
 #
-#   LOSS_ON=decision sbatch scripts/gate_scale.sh 1
-#                              -> logs/gate_scale1_400steps_lr1e-4_decision.log
+#   LOSS_ON=decision OVERFIT_SELECT=stratified sbatch scripts/gate_scale.sh 1
+#                    -> logs/gate_scale1_400steps_lr1e-4_decision_stratified.log
 #   OVERFIT_SELECT=stratified sbatch scripts/gate_scale.sh 1
 #                              -> logs/gate_scale1_400steps_lr1e-4_stratified.log
 #   TASK_STREAM=question sbatch scripts/gate_scale.sh 1
 #                              -> logs/gate_scale1_400steps_lr1e-4_question.log
 #
 # LOSS_ON (--loss-on, default all) puts the loss on the Yes/No token alone, and the
-# verdict is then condition 3 alone. OVERFIT_SELECT (--overfit-select, default head)
-# draws the 10 records so every superclass has at least three Yes and three No,
-# where head's ten are all normal. TASK_STREAM (--task-stream, default prompt) is
-# what the resampler's second stream reads: prompt-and-target, question (the
-# paraphrase alone, no patient context) or none; it tags as _withtarget, _question,
-# _notext. Like the norm flags, a non-default value goes into the log name and the
-# checkpoint dir.
+# verdict is then condition 4 alone; it needs OVERFIT_SELECT=stratified, and the
+# free-generation pass is skipped (condition 2 is not judged there).
+# OVERFIT_SELECT (--overfit-select, default head) draws the 10 records so every
+# superclass has at least three Yes and three No, where head's ten are all normal.
+# TASK_STREAM (--task-stream, default prompt) is what the resampler's second stream
+# reads: prompt-and-target, question (the paraphrase alone, no patient context) or
+# none; it tags as _withtarget, _question, _notext. Like the norm flags, a
+# non-default value goes into the log name and the checkpoint dir.
 #
 # Every run's log and checkpoint directory are named for what produced them --
 # logs/gate_scale<scale>_<steps>steps_lr<lr><flags>.log -- so several can be in the
@@ -235,6 +236,14 @@ esac
 case "$OVERFIT_SELECT" in head|stratified) ;; *)
     echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
 esac
+# Caught again in train.py: --loss-on decision on the head set is refused, since
+# every head record answers each question the same way and the gate can then pass
+# on the question alone.
+if [[ "$LOSS_ON" == "decision" && "$OVERFIT_SELECT" == "head" ]]; then
+    echo "LOSS_ON=decision needs OVERFIT_SELECT=stratified: on the head set every" \
+         "record answers each question the same way" >&2
+    exit 2
+fi
 [[ "$LOSS_ON" == "all" ]] || TAG+="_$LOSS_ON"
 [[ "$OVERFIT_SELECT" == "head" ]] || TAG+="_$OVERFIT_SELECT"
 TASK_STREAM="${TASK_STREAM:-prompt}"
