@@ -931,6 +931,36 @@ def test_the_no_context_probe_reads_no_prose_and_scores_the_same_position(tmp_pa
         assert [r["loss"] for r in recs] != [r["loss"] for r in real]
 
 
+def test_the_decision_stop_rule_measures_exactly_what_condition_4_a_measures(tmp_path):
+    """eval_no_context_loss IS condition 4 (a): the gate's real no-context pass,
+    reduced per label as gate_verdict reduces it. Stopping on anything else let a
+    run stop on condition 3, which is not judged, and fail condition 4 at once."""
+    import types
+
+    import numpy as np
+    from overfit_gate import eval_no_context_loss, no_context_pass
+
+    dataset, ctx = _debug_train(), _stub_ctx()
+    indices = list(range(15))
+    args = types.SimpleNamespace(batch_size=4, max_length=2048, seed=0,
+                                 task_stream="prompt", ckpt_dir=str(tmp_path))
+    ctx.resampler.train()
+    stop_rule = eval_no_context_loss(ctx.model, ctx.resampler, ctx.tokenizer, dataset,
+                                     indices, ctx.dev, args)
+    assert ctx.resampler.training, "the stop rule must hand the resampler back in train mode"
+    assert not list(tmp_path.iterdir()), "the stop rule writes nothing"
+
+    ctx.resampler.eval()
+    real = no_context_pass(ctx, dataset, indices, args, "real",
+                           shuffled=False, zero_latents=False)
+    losses = np.array([r["loss"] for r in real])
+    labels = np.array([r["label"] for r in real])
+    assert labels.any() and not labels.all()
+    assert stop_rule["all"] == float(losses.mean())
+    assert stop_rule[True] == float(losses[labels].mean())
+    assert stop_rule[False] == float(losses[~labels].mean())
+
+
 def test_condition_4_is_left_out_under_loss_on_all(capsys):
     tf, gen = _records()
     ok = gate_verdict(tf, gen, [0.01] * N, [TARGET_LEN] * N, 0.1)

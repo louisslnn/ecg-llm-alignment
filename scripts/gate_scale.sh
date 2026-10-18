@@ -80,7 +80,9 @@
 # the loss at the Yes/No token per label. The loop stops when the eval-mode mean
 # loss over all 50 (measured every 50 steps) reaches the target, which is condition
 # 1's own number; stopping is not passing, and the closing GATE PASSED / GATE FAILED
-# line is the verdict and names what failed.
+# line is the verdict and names what failed. Under LOSS_ON=decision both move to
+# condition 4: the verdict is judged on it, and the loop stops on its no-context
+# Yes/No loss per label.
 #
 # WHAT TO READ: the gate verdict (exit 0 = passed), the "resampler architecture"
 # line, and the "prefix scale @ step N" lines, which report the measured latent

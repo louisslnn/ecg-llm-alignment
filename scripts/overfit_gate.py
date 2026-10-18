@@ -55,8 +55,11 @@ donor is written into every shuffled record as ``donor_ecg_id``.
 
 UNDER --loss-on decision the training loss lands on one position per example, the
 Yes/No token condition 3 reads, and nothing supervises the prose. The stop rule
-moves with it: :func:`eval_decision_loss`, the eval-mode decision-token mean per
-label, read at the very positions the training loss used. And the controls are
+moves with the verdict: :func:`eval_no_context_loss`, condition 4 (a)'s own number
+-- the eval-mode no-context loss per label, through the same function the gate's
+pass calls -- so the loop cannot stop on a number the judged condition then fails.
+Condition 3's teacher-forced number (:func:`eval_decision_loss`) is logged beside
+it at every check, not stopped on. And the controls are
 reported a second time ON THE DECISION TOKEN, split by label
 (:func:`print_decision_controls`). Under --loss-on all, the default, none of this
 paragraph or the next applies.
@@ -199,12 +202,12 @@ def eval_mean_loss(model, resampler, batches, dev, task_stream: str = "prompt") 
 def eval_decision_loss(model, resampler, batches, dev, task_stream: str = "prompt"):
     """Condition 3's quantity: eval-mode loss at the decision token, mean per label.
 
-    The --loss-on decision stop rule. Returns ``{"all": mean, True: mean, False:
-    mean}`` over examples, with None for a label that has no examples. The position
-    is the one ``decision_mask`` marks -- the mask the training loss was computed
-    under -- so the stop rule cannot drift from what is being trained;
-    condition 3 then locates the token again from the target text, independently.
-    Leaves the resampler in whichever mode it was found.
+    Logged at every --loss-on decision stop check beside the stop rule
+    (:func:`eval_no_context_loss`), not used to stop: condition 3 is not judged.
+    Returns :func:`mean_by_label`'s dict. The position is the one ``decision_mask``
+    marks -- the mask the training loss was computed under -- and condition 3 then
+    locates the token again from the target text, independently. Leaves the
+    resampler in whichever mode it was found.
     """
     was_training = resampler.training
     resampler.eval()
@@ -219,7 +222,13 @@ def eval_decision_loss(model, resampler, batches, dev, task_stream: str = "promp
             losses.append(position_losses[k])
             labels.append(bool(batch["head_label"][i]))
     resampler.train(was_training)
-    losses, labels = np.asarray(losses, dtype=np.float64), np.asarray(labels)
+    return mean_by_label(losses, labels)
+
+
+def mean_by_label(losses, labels):
+    """``{"all": mean, True: mean, False: mean}`` over examples, with None for a label
+    that has no examples. The stop rules' shape, so train.py logs both alike."""
+    losses, labels = np.asarray(losses, dtype=np.float64), np.asarray(labels, dtype=bool)
     out = {"all": float(losses.mean())}
     for label in (True, False):
         subset = losses[labels == label]
@@ -660,8 +669,43 @@ def no_context_text(tokenizer, target):
     return context, ids[k], None
 
 
-@torch.no_grad()
 def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents):
+    """Condition 4 under one condition, written to gate_no_context_<name>.jsonl.
+
+    :func:`no_context_records` on the gate's context; returns its records.
+    """
+    records = no_context_records(ctx.model, ctx.resampler, ctx.tokenizer, ctx.dev,
+                                 dataset, indices, args, shuffled=shuffled,
+                                 zero_latents=zero_latents)
+    with open(os.path.join(args.ckpt_dir, f"gate_no_context_{name}.jsonl"), "w",
+              encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return records
+
+
+@torch.no_grad()
+def eval_no_context_loss(model, resampler, tokenizer, dataset, indices, dev, args):
+    """Condition 4 (a)'s quantity: eval-mode no-context loss, mean per label.
+
+    The --loss-on decision stop rule. The real condition of :func:`no_context_records`
+    -- the very function the gate's condition 4 pass calls -- over the same indices,
+    reduced the way :func:`gate_verdict` reduces it, so the loop stops on the number
+    the judged condition then re-measures. Returns :func:`mean_by_label`'s dict.
+    Fatal, through no_context_records, if an example's context cannot be built.
+    Leaves the resampler in whichever mode it was found.
+    """
+    was_training = resampler.training
+    resampler.eval()
+    records = no_context_records(model, resampler, tokenizer, dev, dataset, indices,
+                                 args, shuffled=False, zero_latents=False)
+    resampler.train(was_training)
+    return mean_by_label([r["loss"] for r in records], [r["label"] for r in records])
+
+
+@torch.no_grad()
+def no_context_records(model, resampler, tokenizer, dev, dataset, indices, args, *,
+                       shuffled, zero_latents):
     """Condition 4: the decision token after the prompt and "Conclusion:" alone.
 
     Each example goes through training's own collate with its target REPLACED by
@@ -675,10 +719,8 @@ def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents
     Yes against No over the readout's own candidate ids, as evaluation computes it.
 
     Fatal if any example's context cannot be built or the collate did not lay it out
-    as built. Writes gate_no_context_<name>.jsonl and returns the records, in
-    ``indices`` order.
+    as built. Returns the records, in ``indices`` order; writes nothing.
     """
-    tokenizer, dev = ctx.tokenizer, ctx.dev
     collate = make_collate_fn(tokenizer, max_length=args.max_length,
                               strip_think=getattr(dataset, "base", dataset).config.strip_think)
     # evaluation's readout: every single-token Yes / No spelling, pooled
@@ -699,13 +741,13 @@ def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents
         batch = collate([{**it, "target": context} for it, (context, _, _) in zip(items, built)])
         task_ids, task_mask = task_stream_ids(batch, args.task_stream)
         full_embeds, full_attn, Lq = splice_prefix(
-            ctx.model, ctx.resampler, batch["ecg_embed"].to(dev),
+            model, resampler, batch["ecg_embed"].to(dev),
             batch["input_ids"].to(dev), batch["attention_mask"].to(dev), dev,
             zero_latents=zero_latents, task_ids=task_ids.to(dev),
             task_mask=task_mask.to(dev))
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = ctx.model(inputs_embeds=full_embeds, attention_mask=full_attn,
-                               use_cache=False).logits
+            logits = model(inputs_embeds=full_embeds, attention_mask=full_attn,
+                           use_cache=False).logits
         for b, (it, (context, decision_id, _)) in enumerate(zip(items, built)):
             span = (batch["labels"][b] != -100).nonzero().flatten()
             n_ctx = len(tokenizer(context, add_special_tokens=False).input_ids)
@@ -729,10 +771,6 @@ def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents
     if problems:
         sys.exit(f"GATE: condition 4 {CONDITIONS[4]} cannot be evaluated for "
                  f"{len(problems)} of {len(indices)} examples:\n" + "\n".join(problems))
-    with open(os.path.join(args.ckpt_dir, f"gate_no_context_{name}.jsonl"), "w",
-              encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
     return records
 
 

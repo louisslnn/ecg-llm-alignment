@@ -24,12 +24,12 @@ best.pt (lowest val loss) are kept.
     # after "Conclusion:" (--loss-on decision; the default, all, is the whole
     # target). Prompt, prefix, task stream and tokenisation are identical; only
     # which target positions contribute changes. Every loss this mode logs is the
-    # decision-token mean and is labelled so, the stop rule measures that token per
-    # label, the real/shuffled/zeroed controls are reported at that token, split by
-    # label, and the gate is judged on condition 4 alone: the decision token after
-    # the prompt and "Conclusion:" with no target prose, which must be low under the
-    # real ECG and at least 0.5 nats higher under a donor ECG that answers the other
-    # way. It needs the stratified set (below): on the head set every record
+    # decision-token mean and is labelled so, the real/shuffled/zeroed controls are
+    # reported at that token, split by label, and the gate is judged on condition 4
+    # alone: the decision token after the prompt and "Conclusion:" with no target
+    # prose, which must be low under the real ECG and at least 0.5 nats higher under
+    # a donor ECG that answers the other way. The stop rule is condition 4 (a), that
+    # token's real loss per label. It needs the stratified set (below): on the head set every record
     # answers every question the same way, and the controls cannot show anything.
     # The free-generation pass is skipped, since condition 2 is not judged here
     # (--no-skip-generation to run it). Give it its own --ckpt-dir: it writes the
@@ -85,6 +85,7 @@ from overfit_gate import (  # noqa: E402
     GATE_DECISION_LOSS,
     eval_decision_loss,
     eval_mean_loss,
+    eval_no_context_loss,
     gate_batches,
     run_gate,
 )
@@ -198,9 +199,10 @@ def parse_args():
                          "quantity, so it must sit below --gate-threshold. It only "
                          "decides when training stops; the verdict is the "
                          "three-condition gate that runs afterwards. Under --loss-on "
-                         "decision it is the eval-mode DECISION-TOKEN mean that must "
-                         "reach this, on label=True and label=False separately -- "
-                         "condition 3's quantity, whose threshold is fixed at "
+                         "decision it is the eval-mode NO-CONTEXT decision-token "
+                         "loss (prompt, then \"Conclusion:\" alone) that must reach "
+                         "this, on label=True and label=False separately -- condition "
+                         "4 (a)'s quantity, whose threshold is fixed at "
                          f"{GATE_DECISION_LOSS:g}")
     ap.add_argument("--overfit-eval-every", type=int, default=50,
                     help="check that stop rule every N steps (one no-grad pass over "
@@ -233,14 +235,14 @@ def parse_args():
                  f"drop one of the two (got --prefix-scale {args.prefix_scale:g})")
     # The loop stops on the number condition 1 then re-measures. A stop target at or
     # above the gate's threshold would stop a run the gate is bound to fail.
-    # Under --loss-on decision the loop stops on condition 3's number instead, and
-    # the same holds against that condition's threshold.
+    # Under --loss-on decision the loop stops on condition 4 (a)'s number instead,
+    # and the same holds against that condition's threshold.
     if args.overfit is not None and args.loss_on == "decision":
         if args.overfit_target_loss >= GATE_DECISION_LOSS:
             ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be "
                      f"below the gate's decision-token threshold "
                      f"({GATE_DECISION_LOSS:g}): under --loss-on decision the loop "
-                     "stops on the same quantity the gate's third condition checks")
+                     "stops on the same quantity the gate's condition 4 (a) checks")
     elif args.overfit is not None and args.overfit_target_loss >= args.gate_threshold:
         ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be below "
                  f"--gate-threshold ({args.gate_threshold:g}): the loop stops on the "
@@ -744,7 +746,14 @@ def prefix_scale_line(model, resampler, batch, dev, task_stream: str = "prompt")
             + gain)
 
 
-def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
+def _by_label(means):
+    return "  ".join(f"label={label} " + ("no examples" if means[label] is None
+                                          else f"{means[label]:.4f}")
+                     for label in (True, False))
+
+
+def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
+                  no_context_stop=None):
     """Train until the overfit set's eval-mode mean loss reaches the target, or the cap.
 
     The stop rule is gate condition 1's own quantity (overfit_gate.eval_mean_loss
@@ -757,24 +766,36 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
     generation was degenerate. The caller runs the gate on the result either way, so
     a run that stops at the cap still reports all three conditions.
 
-    Under --loss-on decision the same holds one condition over. The step loss is the
-    decision-token mean of the batch, and the stop rule is condition 3's quantity
-    (overfit_gate.eval_decision_loss): the eval-mode decision-token mean, which has
-    to reach the target on label=True and on label=False separately, because that is
-    how the gate judges it. A mean over both would stop a constant-Yes resampler on
-    a set where positives dominate, for the gate to fail it at once. Both lines are
-    labelled decision-token, so neither can be read against a --loss-on all log.
+    Under --loss-on decision the same holds for the condition judged there. The
+    step loss is the decision-token mean of the batch, and the stop rule is
+    condition 4 (a)'s quantity (overfit_gate.eval_no_context_loss, through
+    ``no_context_stop``): the eval-mode decision-token loss after the prompt and
+    "Conclusion:" alone, which has to reach the target on label=True and on
+    label=False separately, because that is how the gate judges it. A mean over
+    both would stop a constant-Yes resampler on a set where positives dominate,
+    for the gate to fail it at once. Condition 3's teacher-forced number
+    (overfit_gate.eval_decision_loss over ``eval_batches``) is logged beside it at
+    every check: it is not judged, and stopping on it let a run stop on a number
+    the judged condition then failed. Every line is labelled decision-token, so
+    none can be read against a --loss-on all log.
+
+    ``no_context_stop`` is ``(tokenizer, dataset, indices)``, the overfit examples
+    in the gate's order; required under --loss-on decision, unused otherwise.
 
     Returns the number of steps taken.
     """
     decision = args.loss_on == "decision"
+    if decision and no_context_stop is None:
+        raise ValueError("--loss-on decision stops on condition 4 (a), which needs "
+                         "no_context_stop")
     loss_name = "decision-token loss" if decision else "loss"
-    stop_name = ("eval-mode decision-token mean, worse label" if decision
+    stop_name = ("eval-mode no-context decision-token mean, worse label" if decision
                  else "eval-mode mean")
     n_examples = sum(len(b["ecg_id"]) for b in eval_batches)
     if decision:
         print(f"overfit [--loss-on decision]: train until the eval-mode "
-              f"DECISION-TOKEN mean over all {n_examples} examples is <= "
+              f"NO-CONTEXT DECISION-TOKEN mean (gate condition 4 (a): the prompt, "
+              f"then \"Conclusion:\" alone) over all {n_examples} examples is <= "
               f"{args.overfit_target_loss} on label=True and on label=False "
               f"separately (checked every {args.overfit_eval_every} steps), at most "
               f"{args.overfit_max_steps} steps; then run the gate")
@@ -808,19 +829,20 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args):
                       flush=True)
             if step % args.overfit_eval_every == 0:
                 if decision:
-                    dec = eval_decision_loss(model, resampler, eval_batches, dev,
-                                             args.task_stream)
-                    by_label = "  ".join(
-                        f"label={label} " + ("no examples" if dec[label] is None
-                                             else f"{dec[label]:.4f}")
-                        for label in (True, False))
+                    tok, ds, idx = no_context_stop
+                    nc = eval_no_context_loss(model, resampler, tok, ds, idx, dev, args)
+                    tf = eval_decision_loss(model, resampler, eval_batches, dev,
+                                            args.task_stream)
                     # A label with no examples cannot hold the loop open; the gate
-                    # fails condition 3 on it whatever the other label reaches.
-                    mean = max(v for v in (dec[True], dec[False]) if v is not None)
-                    print(f"    eval-mode decision-token mean over all {n_examples} "
-                          f"examples @ step {step}: {dec['all']:.4f}  {by_label}  "
-                          f"(stop when each label is <= {args.overfit_target_loss})",
-                          flush=True)
+                    # fails condition 4 (a) on it whatever the other label reaches.
+                    mean = max(v for v in (nc[True], nc[False]) if v is not None)
+                    print(f"    eval-mode no-context decision-token mean over all "
+                          f"{n_examples} examples @ step {step}: {nc['all']:.4f}  "
+                          f"{_by_label(nc)}  (stop when each label is <= "
+                          f"{args.overfit_target_loss})", flush=True)
+                    print(f"    eval-mode teacher-forced decision-token mean @ step "
+                          f"{step}: {tf['all']:.4f}  {_by_label(tf)}  (condition 3, "
+                          "not judged and not the stop rule)", flush=True)
                 else:
                     mean = eval_mean_loss(model, resampler, eval_batches, dev,
                                           args.task_stream)
@@ -999,7 +1021,7 @@ def main():
         steps = train_overfit(model, resampler, optimizer, train_loader,
                               gate_batches(tokenizer, dataset, indices, args,
                                            collate=train_loader.collate_fn),
-                              dev, args)
+                              dev, args, no_context_stop=(tokenizer, dataset, indices))
         # Drop the last step's gradients first: nothing below needs them.
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
