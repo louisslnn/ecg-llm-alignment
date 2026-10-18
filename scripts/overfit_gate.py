@@ -71,7 +71,16 @@ before "Conclusion:", which states the finding in prose, so the decision token c
 be read off the context: a constant prefix reached 0.018 on all fifty without the
 ECG. A verdict resting on it can pass a model that never opens the waveform.
 
-Two things follow, both enforced by train.py's parser: --loss-on decision refuses
+UNDER --loss-on decision-no-context everything above holds, and the one thing that
+changes is the training sequence: each target is cut to "Conclusion:" and the
+decision token (:func:`no_context_target`), so the loss is condition 4's own
+quantity. Under --loss-on decision the token is trained with the whole target in
+context, which supplies the answer, so condition 4 judges a behaviour that is never
+trained: one such run reached 0.0000 on condition 3 and 7.99 on condition 4 (a) for
+label=False, answering Yes to everything. Both modes are judged on condition 4, and
+both are what DECISION_MODES names.
+
+Two things follow, both enforced by train.py's parser for either mode: it refuses
 --overfit-select head (all ten head records give each question the same answer, so
 condition 4's shuffled column and donor rows cannot show anything and the verdict
 would be meaningless rather than merely weak), and --skip-generation is on by
@@ -79,7 +88,7 @@ default there, since the free-generation pass was 21 of the last run's 25 minute
 and measures a condition that is not judged. Skipped, condition 2 is printed as not
 run, never as a failure.
 
-4. THE DECISION TOKEN WITH NO TARGET CONTEXT, judged under --loss-on decision only.
+4. THE DECISION TOKEN WITH NO TARGET CONTEXT, judged under DECISION_MODES only.
    The student prompt followed by "Conclusion:" and nothing else -- no Evidence, no
    Reasoning -- and the loss and p_yes at the next position (:func:`no_context_pass`).
    With no prose to read the answer off, what predicts the token is the prompt,
@@ -155,6 +164,10 @@ GATE_MATCH_RATE = 0.90        # fraction whose generated Yes/No matches the labe
 GATE_DECISION_LOSS = 0.1      # per label subset, at the token after "Conclusion:"
 GATE_SHUFFLE_GAP = 0.5        # nats, condition 4 (b); why 0.5: the module docstring
 GATE_MIN_DONOR_ROWS = 8       # examples each condition 4 (b) row needs to be judged
+
+# The --loss-on modes whose loss is the Yes/No token alone. Both are judged the same
+# way, on condition 4; they differ only in what precedes the token in training.
+DECISION_MODES = ("decision", "decision-no-context")
 
 CONDITIONS = {1: "teacher-forced loss", 2: "free generation", 3: "decision-token loss",
               4: "decision token, no target context"}
@@ -270,7 +283,7 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
     sequences are parallel, one entry per example, in the same order.
 
     ``loss_on`` is train.py's --loss-on, and picks the rule. Under "all" conditions
-    1-3 are judged. Under "decision" condition 4 alone is judged, and 1-3 are
+    1-3 are judged. Under either of DECISION_MODES condition 4 alone is judged, and 1-3 are
     measured and printed with their thresholds as ever but marked not judged
     (condition 3 with a line saying why); the closing line names that rule.
 
@@ -278,7 +291,7 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
     then printed as not run, which is only allowed where it is not judged.
 
     ``no_context`` maps a condition name to its :func:`no_context_pass` records,
-    parallel to the rest; "real" is required under "decision", and "shuffled" is
+    parallel to the rest; "real" is required under DECISION_MODES, and "shuffled" is
     there unless the shuffle was skipped. ``donor_labels`` is the shuffled donor's
     known answer per example (:func:`donor_answers`). None for both, as under "all",
     leaves condition 4 out entirely.
@@ -287,17 +300,17 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
     donor-answers-opposite row has fewer than GATE_MIN_DONOR_ROWS examples: that is
     not a pass, and it is not a failure either, and the closing line says which.
     """
-    if loss_on not in ("all", "decision"):
+    if loss_on not in ("all", *DECISION_MODES):
         raise ValueError(f"unknown loss_on {loss_on!r}")
-    decision = loss_on == "decision"
+    decision = loss_on in DECISION_MODES
     judged = {4} if decision else {1, 2, 3}
     skipped = gen_records is None
     if skipped and 2 in judged:
         raise ValueError("free generation was skipped, but condition 2 is judged "
                          f"under --loss-on {loss_on}")
     if decision and (no_context is None or "real" not in no_context):
-        raise ValueError("condition 4 is judged under --loss-on decision, but its real "
-                         "no-context pass is missing")
+        raise ValueError(f"condition 4 is judged under --loss-on {loss_on}, but its "
+                         "real no-context pass is missing")
     n = len(tf_records)
     if not (len(decision_losses) == len(target_lengths) == n
             and (skipped or len(gen_records) == n)
@@ -391,8 +404,8 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
             f"   [NOT judged: fewer than {GATE_MIN_DONOR_ROWS} examples in a donor row]"
             if cond == 4 and decision else
             f"   [printed, NOT judged under --loss-on {loss_on}]" if cond == 4 else
-            "   [not run, NOT judged under --loss-on decision]" if cond == 2 and skipped
-            else "   [printed, NOT judged under --loss-on decision]"))
+            f"   [not run, NOT judged under --loss-on {loss_on}]" if cond == 2 and skipped
+            else f"   [printed, NOT judged under --loss-on {loss_on}]"))
         for c, what, measured, need, ok in rows:
             if c != cond:
                 continue
@@ -419,10 +432,10 @@ def gate_verdict(tf_records, gen_records, decision_losses, target_lengths, thres
     # Which rule produced the verdict, on the verdict's own line. Empty under "all",
     # where the line reads as it always has.
     rule = ("" if not decision else
-            "  [--loss-on decision rule: judged on condition 4 alone; conditions 1 and 3 "
+            f"  [--loss-on {loss_on} rule: judged on condition 4 alone; conditions 1 and 3 "
             "are printed and condition 2 was not run (--skip-generation), none judged]"
             if skipped else
-            "  [--loss-on decision rule: judged on condition 4 alone; conditions 1, 2 "
+            f"  [--loss-on {loss_on} rule: judged on condition 4 alone; conditions 1, 2 "
             "and 3 are printed, not judged]")
     if decision and thin:
         print(f"GATE NOT JUDGED: condition 4 needs at least {GATE_MIN_DONOR_ROWS} examples "
@@ -669,6 +682,33 @@ def no_context_text(tokenizer, target):
     return context, ids[k], None
 
 
+def no_context_target(tokenizer, target):
+    """``(cut, decision_id, why)``: what --loss-on decision-no-context trains on.
+
+    The target cut to :func:`no_context_text`'s context plus the decision token,
+    from the target's own text -- "Conclusion: Yes" or "Conclusion: No" as the
+    target spells it. Tokenised on its own it must be the context's tokens and then
+    ``decision_id``, so the supervised position sees exactly the tokens condition 4
+    shows the model and is asked for exactly the token condition 4 scores. The
+    logits there depend on nothing after them, so the training loss at that
+    position IS condition 4's loss on the same weights. ``why`` names the problem
+    when the cut cannot be built, and is None otherwise.
+    """
+    context, decision_id, why = no_context_text(tokenizer, target)
+    if why:
+        return None, None, why
+    _, offsets = tokenise_target(tokenizer, target)
+    k, _ = decision_index(target, offsets)
+    start = target.index(MARKER)
+    cut = target[start:offsets[k][1]]
+    own = tokenizer(cut, add_special_tokens=False).input_ids
+    want = tokenizer(context, add_special_tokens=False).input_ids + [decision_id]
+    if own != want:
+        return None, None, (f"{cut!r} tokenises on its own as {own}, not the context "
+                            f"then the decision token {want}")
+    return cut, decision_id, None
+
+
 def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents):
     """Condition 4 under one condition, written to gate_no_context_<name>.jsonl.
 
@@ -848,7 +888,7 @@ def run_gate(model, resampler, tokenizer, dataset, indices, args):
     if args.skip_generation:
         # train.py allows this only where condition 2 is not judged
         print("# GATE PASS 2 of 2: free generation -- SKIPPED (--skip-generation); "
-              "condition 2 is not judged under --loss-on decision")
+              f"condition 2 is not judged under --loss-on {args.loss_on}")
         print("#" * 64, flush=True)
         gen_records = None
     else:
@@ -866,7 +906,7 @@ def run_gate(model, resampler, tokenizer, dataset, indices, args):
     located = locate_decision_tokens(tokenizer, targets, tf_records)
 
     by_condition = run_controls(ctx, dataset, indices, args, tf_records, shuffled_view)
-    if args.loss_on == "decision":
+    if args.loss_on in DECISION_MODES:
         # Diagnostic: condition 3 is printed but not judged under this rule. Each
         # control goes through the same locator and the same fatal length check.
         decision = {name: [loss for loss, _ in
@@ -898,7 +938,7 @@ def run_gate(model, resampler, tokenizer, dataset, indices, args):
             scope="the verdict reads its real label rows and its donor rows")
         print_no_context_auprc(no_context, labels)
 
-    decision = args.loss_on == "decision"
+    decision = args.loss_on in DECISION_MODES
     return gate_verdict(tf_records, gen_records,
                         [loss for loss, _ in located], [n for _, n in located],
                         args.gate_threshold, loss_on=args.loss_on,

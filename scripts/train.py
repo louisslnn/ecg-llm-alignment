@@ -37,6 +37,14 @@ best.pt (lowest val loss) are kept.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --loss-on decision \
         --overfit-select stratified
 
+    # the same, with the Yes/No token trained the way condition 4 asks for it: each
+    # target cut to "Conclusion:" and that token, no Evidence and no Reasoning
+    # (--loss-on decision-no-context). Same prefix, task stream and everything else;
+    # the training loss, the stop rule and condition 4 are then one quantity. Under
+    # --loss-on decision the full target sits in context and supplies the answer.
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 \
+        --loss-on decision-no-context --overfit-select stratified
+
     # the same gate on records drawn so that every superclass has at least three
     # Yes and three No among them (--overfit-select stratified; the default, head,
     # is the first N train examples). On the head set the answer can be read off
@@ -82,11 +90,13 @@ from src.model.resampler import (  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 from evaluate import checkpoint_task_stream, require_strip_think_match  # noqa: E402
 from overfit_gate import (  # noqa: E402
+    DECISION_MODES,
     GATE_DECISION_LOSS,
     eval_decision_loss,
     eval_mean_loss,
     eval_no_context_loss,
     gate_batches,
+    no_context_target,
     run_gate,
 )
 from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
@@ -101,7 +111,7 @@ from yn_token_loss import MARKER, decision_index, tokenise_target  # noqa: E402
 
 GiB = 1024 ** 3
 
-LOSS_ON_MODES = ("all", "decision")
+LOSS_ON_MODES = ("all", *DECISION_MODES)
 OVERFIT_SELECT_MODES = ("head", "stratified")
 # --overfit-select stratified: every superclass has at least this many Yes and this
 # many No among the chosen records. The gate's definition, changed here, not per run.
@@ -162,8 +172,13 @@ def parse_args():
                          "Nothing else differs -- same prompt, prefix, task stream, "
                          "tokenisation and -100 masking of prompt and padding. An "
                          "example whose decision token cannot be placed is fatal, "
-                         "never skipped. Every loss logged under 'decision' is the "
-                         "decision-token mean and is labelled so")
+                         "never skipped. 'decision-no-context' is that same one "
+                         "token with the target cut to \"Conclusion:\" and the token "
+                         "-- no Evidence, no Reasoning -- which is what gate condition "
+                         "4 measures; 'decision' trains it with the whole target in "
+                         "context, which supplies the answer. Every loss logged under "
+                         "either is the decision-token mean and is labelled so. "
+                         "Recorded in every checkpoint; a resume must match it")
     ap.add_argument("--strip-think", action=argparse.BooleanOptionalAction,
                     default=DatasetConfig.strip_think,
                     help="strip the template's trailing open <think> block from the "
@@ -212,12 +227,13 @@ def parse_args():
                     help="in --overfit mode, the mean teacher-forced loss over the "
                          "overfit examples must be below this. One of three gate "
                          "conditions; see scripts/overfit_gate.py for the other two. "
-                         "Under --loss-on decision this condition is printed against "
-                         "the threshold but not judged")
+                         "Under --loss-on decision or decision-no-context this "
+                         "condition is printed against the threshold but not judged")
     ap.add_argument("--skip-generation", action=argparse.BooleanOptionalAction,
                     default=None,
                     help="skip the gate's free-generation pass, condition 2. ON by "
-                         "default under --loss-on decision, where nothing supervises "
+                         "default under --loss-on decision and decision-no-context, "
+                         "where nothing supervises "
                          "the prose, condition 2 is not judged, and the pass is most "
                          "of the gate's time; --no-skip-generation runs it anyway. "
                          "OFF otherwise, and refused under --loss-on all, where "
@@ -235,13 +251,13 @@ def parse_args():
                  f"drop one of the two (got --prefix-scale {args.prefix_scale:g})")
     # The loop stops on the number condition 1 then re-measures. A stop target at or
     # above the gate's threshold would stop a run the gate is bound to fail.
-    # Under --loss-on decision the loop stops on condition 4 (a)'s number instead,
-    # and the same holds against that condition's threshold.
-    if args.overfit is not None and args.loss_on == "decision":
+    # Under either decision mode the loop stops on condition 4 (a)'s number
+    # instead, and the same holds against that condition's threshold.
+    if args.overfit is not None and args.loss_on in DECISION_MODES:
         if args.overfit_target_loss >= GATE_DECISION_LOSS:
             ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be "
                      f"below the gate's decision-token threshold "
-                     f"({GATE_DECISION_LOSS:g}): under --loss-on decision the loop "
+                     f"({GATE_DECISION_LOSS:g}): under --loss-on {args.loss_on} the loop "
                      "stops on the same quantity the gate's condition 4 (a) checks")
     elif args.overfit is not None and args.overfit_target_loss >= args.gate_threshold:
         ap.error(f"--overfit-target-loss ({args.overfit_target_loss:g}) must be below "
@@ -252,15 +268,16 @@ def parse_args():
     # On the head set all ten records are normal: every question has one answer
     # across the set, so condition 4's shuffled column and donor rows cannot show
     # anything, and its verdict would be meaningless rather than merely weak.
-    if (args.overfit is not None and args.loss_on == "decision"
+    if (args.overfit is not None and args.loss_on in DECISION_MODES
             and args.overfit_select == "head"):
-        ap.error("--loss-on decision cannot run with --overfit-select head (the "
+        ap.error(f"--loss-on {args.loss_on} cannot run with --overfit-select head (the "
                  "default): all ten head records answer each question the same way, "
                  "so condition 4's shuffled column and donor-answers-opposite rows "
                  "cannot show anything and its verdict would be meaningless. Pass "
                  "--overfit-select stratified")
     if args.skip_generation is None:
-        args.skip_generation = args.overfit is not None and args.loss_on == "decision"
+        args.skip_generation = (args.overfit is not None
+                                and args.loss_on in DECISION_MODES)
     elif args.skip_generation and args.overfit is None:
         ap.error("--skip-generation skips a pass of the --overfit gate; without "
                  "--overfit N it would be silently ignored")
@@ -546,6 +563,46 @@ def make_decision_collate(tokenizer, collate):
     return decision_collate
 
 
+def make_no_context_collate(tokenizer, collate):
+    """--loss-on decision-no-context's collate: each target cut to "Conclusion:" and
+    its Yes/No token, then :func:`make_decision_collate` over the cut.
+
+    The cut is overfit_gate.no_context_target's, from the target's own text. So the
+    prompt, the template, strip_think, the question stream and the -100 masking are
+    training's as ever, the batch is what make_decision_collate makes of it with
+    every one of its checks, and the one supervised position sees "Conclusion:" and
+    nothing of the Evidence or Reasoning before it -- exactly what gate condition 4
+    shows the model. The marked token must also be the one condition 4 scores, id
+    for id. Any example that fails either raises DecisionTokenError naming it;
+    nothing is skipped, for the reason make_decision_collate gives.
+    """
+    decision_collate = make_decision_collate(tokenizer, collate)
+
+    def no_context_collate(batch):
+        cut, want, problems = [], [], []
+        for b in batch:
+            target, decision_id, why = no_context_target(tokenizer, b["target"])
+            if why:
+                problems.append(f"  {b['ecg_id']:>7} {b['superclass']:<6} {why}")
+                continue
+            cut.append({**b, "target": target})
+            want.append(decision_id)
+        if problems:
+            raise DecisionTokenError(
+                f"the target cannot be cut to {MARKER!r} and its decision token for "
+                f"{len(problems)} of the {len(batch)} examples in a batch:\n"
+                + "\n".join(problems))
+        out = decision_collate(cut)
+        got = out["labels"][out["decision_mask"]].tolist()   # one per row, in order
+        if got != want:
+            raise DecisionTokenError(
+                f"the marked tokens {got} are not the decision tokens condition 4 "
+                f"scores, {want}")
+        return out
+
+    return no_context_collate
+
+
 def label_counts(examples):
     """superclass -> {"yes": n, "no": n} over ``examples``, in SUPERCLASSES order."""
     counts = {sc: {"yes": 0, "no": 0} for sc in SUPERCLASSES}
@@ -664,6 +721,8 @@ def build_loaders(args, tokenizer, data_cfg):
                               strip_think=data_cfg.strip_think)
     if args.loss_on == "decision":
         collate = make_decision_collate(tokenizer, collate)
+    elif args.loss_on == "decision-no-context":
+        collate = make_no_context_collate(tokenizer, collate)
     g = torch.Generator()
     g.manual_seed(args.seed)
 
@@ -766,8 +825,10 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
     generation was degenerate. The caller runs the gate on the result either way, so
     a run that stops at the cap still reports all three conditions.
 
-    Under --loss-on decision the same holds for the condition judged there. The
-    step loss is the decision-token mean of the batch, and the stop rule is
+    Under either decision mode the same holds for the condition judged there. The
+    step loss is the decision-token mean of the batch (with no target context under
+    decision-no-context, where it is the stop rule's own quantity in train mode),
+    and the stop rule is
     condition 4 (a)'s quantity (overfit_gate.eval_no_context_loss, through
     ``no_context_stop``): the eval-mode decision-token loss after the prompt and
     "Conclusion:" alone, which has to reach the target on label=True and on
@@ -780,20 +841,23 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
     none can be read against a --loss-on all log.
 
     ``no_context_stop`` is ``(tokenizer, dataset, indices)``, the overfit examples
-    in the gate's order; required under --loss-on decision, unused otherwise.
+    in the gate's order; required under DECISION_MODES, unused otherwise.
+    ``eval_batches`` carries the FULL target under both, with the decision mask, so
+    condition 3's line is the teacher-forced number in both.
 
     Returns the number of steps taken.
     """
-    decision = args.loss_on == "decision"
+    decision = args.loss_on in DECISION_MODES
     if decision and no_context_stop is None:
-        raise ValueError("--loss-on decision stops on condition 4 (a), which needs "
-                         "no_context_stop")
-    loss_name = "decision-token loss" if decision else "loss"
+        raise ValueError(f"--loss-on {args.loss_on} stops on condition 4 (a), which "
+                         "needs no_context_stop")
+    loss_name = {"all": "loss", "decision": "decision-token loss",
+                 "decision-no-context": "no-context decision-token loss"}[args.loss_on]
     stop_name = ("eval-mode no-context decision-token mean, worse label" if decision
                  else "eval-mode mean")
     n_examples = sum(len(b["ecg_id"]) for b in eval_batches)
     if decision:
-        print(f"overfit [--loss-on decision]: train until the eval-mode "
+        print(f"overfit [--loss-on {args.loss_on}]: train until the eval-mode "
               f"NO-CONTEXT DECISION-TOKEN mean (gate condition 4 (a): the prompt, "
               f"then \"Conclusion:\" alone) over all {n_examples} examples is <= "
               f"{args.overfit_target_loss} on label=True and on label=False "
@@ -862,11 +926,13 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
 
 def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
           start_epoch, global_step, best_val):
-    # Under --loss-on decision every loss here is the decision-token mean, and each
-    # line says so: it starts near 0.5 where the whole-target loss starts near 3.
-    decision = args.loss_on == "decision"
-    loss_name = "decision-token loss" if decision else "loss"
-    tag = "decision_token_" if decision else ""
+    # Under either decision mode every loss here is the decision-token mean, and
+    # each line says which: it starts near 0.5 where the whole-target loss starts
+    # near 3, and the two decision modes differ in what precedes the token.
+    loss_name = {"all": "loss", "decision": "decision-token loss",
+                 "decision-no-context": "no-context decision-token loss"}[args.loss_on]
+    tag = {"all": "", "decision": "decision_token_",
+           "decision-no-context": "no_context_decision_token_"}[args.loss_on]
     for epoch in range(start_epoch, args.epochs):
         resampler.train()
         gpu_reset()
@@ -949,6 +1015,12 @@ def main():
               f"after {MARKER!r}. Every training, stop-rule and validation loss this "
               "run logs is the mean of that token's loss and is labelled "
               "decision-token; none of them is comparable with a --loss-on all log.")
+    elif args.loss_on == "decision-no-context":
+        print(f"loss on: decision-no-context -- ONE position per example, the Yes/No "
+              f"token, with each target cut to {MARKER!r} and that token: no Evidence, "
+              "no Reasoning in context, as gate condition 4 asks for it. Every loss "
+              "this run logs is that token's mean, labelled no-context decision-token; "
+              "none is comparable with a --loss-on all or decision log.")
 
     preflight(args, data_cfg)
     # A resume continues the checkpoint's run, so it has to continue it on the same
@@ -1015,12 +1087,19 @@ def main():
         # order, through the same batches.
         overfit_set = train_loader.dataset          # the Subset build_loaders made
         dataset, indices = overfit_set.dataset, list(overfit_set.indices)
-        # The loader's own collate, so under --loss-on decision these batches carry
-        # the mask the training loss uses -- and every overfit example has had its
-        # decision token placed, or the run has stopped, before the first step.
-        steps = train_overfit(model, resampler, optimizer, train_loader,
-                              gate_batches(tokenizer, dataset, indices, args,
-                                           collate=train_loader.collate_fn),
+        # Materialised through the loader's own collate, so every overfit example
+        # has had its decision token placed (and, under decision-no-context, its
+        # target cut), or the run has stopped, before the first step.
+        eval_batches = gate_batches(tokenizer, dataset, indices, args,
+                                    collate=train_loader.collate_fn)
+        if args.loss_on == "decision-no-context":
+            # Condition 3's log line reads the token with the FULL target in context,
+            # which these cut batches no longer hold.
+            eval_batches = gate_batches(
+                tokenizer, dataset, indices, args, collate=make_decision_collate(
+                    tokenizer, make_collate_fn(tokenizer, max_length=args.max_length,
+                                               strip_think=dataset.config.strip_think)))
+        steps = train_overfit(model, resampler, optimizer, train_loader, eval_batches,
                               dev, args, no_context_stop=(tokenizer, dataset, indices))
         # Drop the last step's gradients first: nothing below needs them.
         optimizer.zero_grad(set_to_none=True)
@@ -1056,4 +1135,4 @@ if __name__ == "__main__":
     try:
         main()
     except DecisionTokenError as err:
-        sys.exit(f"--loss-on decision, FATAL: {err}")
+        sys.exit(f"--loss-on {_RUN_META.get('loss_on', 'decision')}, FATAL: {err}")

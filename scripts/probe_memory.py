@@ -175,6 +175,10 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
                     (train.py's make_decision_collate builds it: the Yes/No token
                     after "Conclusion:"). ``out.loss`` is then the mean of the
                     decision-token loss over the batch's examples.
+        "decision-no-context"
+                    the same, here; the difference is upstream, in what the batch
+                    holds: train.py's make_no_context_collate cuts each target to
+                    "Conclusion:" and its Yes/No token before collating.
 
     Nothing else differs between the two: same inputs, same prefix, same task
     stream. In particular the task mask is read off the FULL labels, before they are
@@ -187,13 +191,13 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
     labels = batch["labels"].to(dev)
     task_ids, task_mask = task_stream_ids(batch, task_stream)
     task_ids, task_mask = task_ids.to(dev), task_mask.to(dev)
-    if loss_on == "decision":
+    if loss_on in ("decision", "decision-no-context"):
         labels = labels.masked_fill(~batch["decision_mask"].to(dev), -100)
         # The mean below is over supervised positions, so a row with none would
         # leave it without a trace: the batch would be a mean over fewer examples.
         per_row = (labels != -100).sum(dim=1)
         if not bool((per_row == 1).all()):
-            raise ValueError("--loss-on decision needs exactly one supervised "
+            raise ValueError(f"--loss-on {loss_on} needs exactly one supervised "
                              f"position per example, got {per_row.tolist()} for "
                              f"{list(zip(batch['ecg_id'], batch['superclass']))}")
     elif loss_on != "all":

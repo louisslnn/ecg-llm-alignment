@@ -56,6 +56,8 @@
 # LOSS_ON (--loss-on, default all) puts the loss on the Yes/No token alone, and the
 # verdict is then condition 4 alone; it needs OVERFIT_SELECT=stratified, and the
 # free-generation pass is skipped (condition 2 is not judged there).
+# LOSS_ON=decision-no-context is the same with each target cut to "Conclusion:" and
+# that token, so the token trains with no prose in context, as condition 4 reads it.
 # OVERFIT_SELECT (--overfit-select, default head) draws the 10 records so every
 # superclass has at least three Yes and three No, where head's ten are all normal.
 # TASK_STREAM (--task-stream, default prompt) is what the resampler's second stream
@@ -80,7 +82,7 @@
 # the loss at the Yes/No token per label. The loop stops when the eval-mode mean
 # loss over all 50 (measured every 50 steps) reaches the target, which is condition
 # 1's own number; stopping is not passing, and the closing GATE PASSED / GATE FAILED
-# line is the verdict and names what failed. Under LOSS_ON=decision both move to
+# line is the verdict and names what failed. Under either decision mode both move to
 # condition 4: the verdict is judged on it, and the loop stops on its no-context
 # Yes/No loss per label.
 #
@@ -129,7 +131,7 @@ usage() {
     echo "   --steps is the --overfit-max-steps cap (default $DEFAULT_STEPS)"
     echo "   --lr is the AdamW learning rate (default $DEFAULT_LR, as train.py uses"
     echo "        in --overfit mode); accepts 1e-4 or 0.0001"
-    echo "   env: LOSS_ON=all|decision (default all),"
+    echo "   env: LOSS_ON=all|decision|decision-no-context (default all),"
     echo "        OVERFIT_SELECT=head|stratified (default head),"
     echo "        TASK_STREAM=prompt|prompt-and-target|question|none (default prompt)"
 }
@@ -232,17 +234,18 @@ LOSS_ON="${LOSS_ON:-all}"
 OVERFIT_SELECT="${OVERFIT_SELECT:-head}"
 # Caught again in train.py; repeated here so a typo fails in seconds, before the
 # module load and the 14B, instead of after.
-case "$LOSS_ON" in all|decision) ;; *)
-    echo "LOSS_ON must be all or decision, got '$LOSS_ON'" >&2; exit 2 ;;
+case "$LOSS_ON" in all|decision|decision-no-context) ;; *)
+    echo "LOSS_ON must be all, decision or decision-no-context, got '$LOSS_ON'" >&2
+    exit 2 ;;
 esac
 case "$OVERFIT_SELECT" in head|stratified) ;; *)
     echo "OVERFIT_SELECT must be head or stratified, got '$OVERFIT_SELECT'" >&2; exit 2 ;;
 esac
-# Caught again in train.py: --loss-on decision on the head set is refused, since
+# Caught again in train.py: either decision mode on the head set is refused, since
 # every head record answers each question the same way and the gate can then pass
 # on the question alone.
-if [[ "$LOSS_ON" == "decision" && "$OVERFIT_SELECT" == "head" ]]; then
-    echo "LOSS_ON=decision needs OVERFIT_SELECT=stratified: on the head set every" \
+if [[ "$LOSS_ON" != "all" && "$OVERFIT_SELECT" == "head" ]]; then
+    echo "LOSS_ON=$LOSS_ON needs OVERFIT_SELECT=stratified: on the head set every" \
          "record answers each question the same way" >&2
     exit 2
 fi

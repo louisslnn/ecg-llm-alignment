@@ -977,3 +977,144 @@ def test_the_no_context_auprc_is_read_against_the_positive_rate(capsys):
     out = print_no_context_auprc({"real": ranked, "shuffled": backwards}, labels)
     assert out["real"] == 1.0 and out["shuffled"] < 0.5
     assert "positive rate 0.4000, the null" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# --loss-on decision-no-context: the token trained as condition 4 reads it.   #
+# --------------------------------------------------------------------------- #
+
+def test_the_no_context_target_is_the_marker_and_its_decision_token():
+    from overfit_gate import no_context_target, no_context_text
+    from src.data.dataset import DatasetConfig, load_student_tokenizer
+
+    tok = load_student_tokenizer(DatasetConfig(debug=True))
+    for e in _debug_train().examples[:100]:
+        cut, decision_id, why = no_context_target(tok, e.target)
+        assert why is None, why
+        assert cut == "Conclusion: " + ("Yes" if e.label else "No")
+        assert decision_id == no_context_text(tok, e.target)[1]
+    assert no_context_target(tok, "Step 1: ...\nno marker here")[2] is not None
+
+
+def test_the_no_context_collate_cuts_the_target_and_changes_nothing_else():
+    import torch
+    import train
+    from src.data.dataset import prompt_only_task_mask
+
+    dataset, tok, base, _, indices = _decision_setup(50)
+    items = [dataset[i] for i in indices]
+    plain, batch = base(items), train.make_no_context_collate(tok, base)(items)
+
+    assert set(batch) - set(plain) == {"decision_mask"}
+    for key in ("ecg_embed", "task_input_ids", "task_attention_mask", "head_label",
+                "ecg_id", "superclass", "strat_fold"):
+        same = plain[key] == batch[key]
+        assert bool(same.all()) if torch.is_tensor(same) else same, key
+    seen = set()
+    for i, item in enumerate(items):
+        # the prompt, token for token, and so the resampler's prompt stream
+        def prompt(b):
+            keep = prompt_only_task_mask(b["attention_mask"], b["labels"])[i].bool()
+            return b["input_ids"][i][keep].tolist()
+        assert prompt(batch) == prompt(plain)
+        # then "Conclusion:", the decision token, EOS -- and nothing else
+        span = (batch["labels"][i] != -100).nonzero().flatten()
+        assert tok.decode(batch["input_ids"][i][span[:-1]]) == \
+            "Conclusion: " + ("Yes" if item["label"] else "No")
+        assert int(batch["input_ids"][i][span[-1]]) == tok.eos_token_id
+        pos = int(batch["decision_mask"][i].nonzero().item())
+        assert pos == int(span[-2])
+        seen.add(tok.decode([int(batch["input_ids"][i, pos])]).strip())
+    assert seen == {"Yes", "No"}
+
+
+def test_the_no_context_training_loss_is_condition_4s_loss(tmp_path):
+    """Training's number under decision-no-context, against condition 4's records on
+    the same weights: the loss optimises exactly what the stop rule and condition 4
+    measure. Under decision the same token, trained with the full target in context,
+    is a different number."""
+    import types
+
+    import pytest
+    import torch
+    import train
+    from overfit_gate import no_context_records
+    from probe_memory import splice_forward
+    from src.model.resampler import PerceiverResamplerConfig, Resampler
+
+    dataset, tok, base, full, _ = _decision_setup()
+    cfg = PerceiverResamplerConfig.debug()
+    model = _loss_student(tok, cfg.embed_dim)
+    torch.manual_seed(0)
+    resampler = Resampler(cfg).eval()
+    dev = torch.device("cpu")
+    indices = list(range(8))
+    items = [dataset[i] for i in indices]
+    args = types.SimpleNamespace(batch_size=8, max_length=2048, seed=0,
+                                 task_stream="prompt", ckpt_dir=str(tmp_path))
+
+    for stream in ("prompt", "question"):
+        args.task_stream = stream
+        batch = train.make_no_context_collate(tok, base)(items)
+        with torch.no_grad():
+            trained = float(splice_forward(model, resampler, batch, dev,
+                                           task_stream=stream,
+                                           loss_on="decision-no-context"))
+            with_prose = float(splice_forward(model, resampler, full(items), dev,
+                                              task_stream=stream, loss_on="decision"))
+        records = no_context_records(model, resampler, tok, dev, dataset, indices, args,
+                                     shuffled=False, zero_latents=False)
+        cond4 = sum(r["loss"] for r in records) / len(records)
+        assert trained == pytest.approx(cond4, abs=1e-5)
+        assert abs(trained - with_prose) > 1e-3
+
+    resampler.train()
+    splice_forward(model, resampler, batch, dev, loss_on="decision-no-context").backward()
+    assert any(p.grad is not None and bool(p.grad.abs().sum() > 0)
+               for p in resampler.parameters())
+
+
+def test_decision_no_context_is_parsed_and_refused_as_decision_is(monkeypatch, capsys):
+    import pytest
+
+    mode = ("--loss-on", "decision-no-context")
+    strat = ("--overfit", "50", "--overfit-select", "stratified")
+    args = _train_args(monkeypatch, *strat, *mode)
+    assert args.loss_on == "decision-no-context" and args.skip_generation is True
+    with pytest.raises(SystemExit):
+        _train_args(monkeypatch, "--overfit", "50", *mode)
+    assert "--loss-on decision-no-context cannot run with --overfit-select head" \
+        in capsys.readouterr().err
+    with pytest.raises(SystemExit):              # held below condition 4 (a)'s 0.1
+        _train_args(monkeypatch, *strat, *mode, "--overfit-target-loss", "0.2")
+    # the hyperparameters are decision's
+    a = vars(_train_args(monkeypatch, *strat, "--loss-on", "decision"))
+    assert {k for k in a if a[k] != vars(args)[k]} == {"loss_on"}
+
+
+def test_a_resume_across_decision_modes_is_refused(tmp_path):
+    import pytest
+    import torch
+    import train
+
+    torch.save({"meta": {"loss_on": "decision"}}, tmp_path / "ckpt_step10.pt")
+    with pytest.raises(SystemExit) as err:
+        train.resume(str(tmp_path), None, None, "cpu", loss_on="decision-no-context")
+    assert "trained with --loss-on decision, this run has --loss-on " \
+        "decision-no-context" in str(err.value)
+    torch.save({"meta": {"loss_on": "decision-no-context"}}, tmp_path / "ckpt_step10.pt")
+    for other in ("decision", "all"):
+        with pytest.raises(SystemExit, match="Pass --loss-on decision-no-context"):
+            train.resume(str(tmp_path), None, None, "cpu", loss_on=other)
+
+
+def test_decision_no_context_is_judged_on_condition_4_and_names_its_rule(capsys):
+    tf, gen = _records(**PROSE_UNTRAINED)
+    no_context, donors = _no_context(tf)
+    assert gate_verdict(tf, None, [0.01] * N, [TARGET_LEN] * N, 0.1,
+                        loss_on="decision-no-context", no_context=no_context,
+                        donor_labels=donors) is True
+    out = capsys.readouterr().out
+    assert "NOT judged under --loss-on decision-no-context" in out
+    assert "[--loss-on decision-no-context rule: judged on condition 4 alone" \
+        in out.splitlines()[-1]
