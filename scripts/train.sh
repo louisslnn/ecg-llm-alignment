@@ -40,20 +40,21 @@
 #   RUN=run3 TASK_STREAM=question sbatch scripts/train.sh
 set -euo pipefail
 
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
+
 # --- which task stream -------------------------------------------------------
 # Read and checked here, before the module load: a variable no script reads is
 # ignored by bash, and an unknown value should fail in a second, not after the 14B.
 TASK_STREAM="${TASK_STREAM:-prompt}"
-case "$TASK_STREAM" in
-    prompt)            STREAM_TAG="" ;;
-    prompt-and-target) STREAM_TAG="_withtarget" ;;
-    question)          STREAM_TAG="_question" ;;
-    none)              STREAM_TAG="_notext" ;;
-    *)
-        echo "TASK_STREAM must be prompt, prompt-and-target, question or none," \
-             "got '$TASK_STREAM'" >&2
-        exit 2 ;;
-esac
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its

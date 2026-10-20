@@ -71,6 +71,13 @@
 #   TASK_STREAM=question OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
 set -euo pipefail
 
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
+
 # --- which gate --------------------------------------------------------------
 LOSS_ON="${LOSS_ON:-all}"
 OVERFIT_SELECT="${OVERFIT_SELECT:-head}"
@@ -92,16 +99,10 @@ if [[ "$LOSS_ON" != "all" && "$OVERFIT_SELECT" == "head" ]]; then
     exit 2
 fi
 TASK_STREAM="${TASK_STREAM:-prompt}"
-case "$TASK_STREAM" in
-    prompt)            STREAM_TAG="" ;;
-    prompt-and-target) STREAM_TAG="_withtarget" ;;
-    question)          STREAM_TAG="_question" ;;
-    none)              STREAM_TAG="_notext" ;;
-    *)
-        echo "TASK_STREAM must be prompt, prompt-and-target, question or none," \
-             "got '$TASK_STREAM'" >&2
-        exit 2 ;;
-esac
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
 # Named into the default checkpoint dir below, and only when not the default, so
 # the baseline gate keeps the directory it has always had.
 GATE_TAG=""

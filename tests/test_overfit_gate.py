@@ -864,7 +864,7 @@ def _stub_ctx():
 def test_the_no_context_text_is_the_marker_and_the_token_condition_3_scores():
     from overfit_gate import no_context_text
     from src.data.dataset import DatasetConfig, load_student_tokenizer
-    from yn_token_loss import decision_index, tokenise_target
+    from decision_token import decision_index, tokenise_target
 
     tok = load_student_tokenizer(DatasetConfig(debug=True))
     for e in _debug_train().examples[:100]:
@@ -889,7 +889,7 @@ def test_the_no_context_probe_reads_no_prose_and_scores_the_same_position(tmp_pa
     from evaluate import teacher_forced_batch
     from overfit_gate import no_context_pass, shuffle_within
     from src.data.dataset import make_collate_fn
-    from yn_token_loss import MARKER, decision_index, tokenise_target
+    from decision_token import MARKER, decision_index, tokenise_target
 
     dataset, ctx = _debug_train(), _stub_ctx()
     tok = ctx.tokenizer
@@ -1038,7 +1038,7 @@ def test_the_no_context_training_loss_is_condition_4s_loss(tmp_path):
     import pytest
     import torch
     import train
-    from overfit_gate import no_context_records
+    from evaluate import no_context_records
     from probe_memory import splice_forward
     from src.model.resampler import PerceiverResamplerConfig, Resampler
 
@@ -1062,8 +1062,10 @@ def test_the_no_context_training_loss_is_condition_4s_loss(tmp_path):
                                            loss_on="decision-no-context"))
             with_prose = float(splice_forward(model, resampler, full(items), dev,
                                               task_stream=stream, loss_on="decision"))
-        records = no_context_records(model, resampler, tok, dev, dataset, indices, args,
-                                     shuffled=False, zero_latents=False)
+        records = no_context_records(
+            model, resampler, tok, dev, dataset, indices, batch_size=args.batch_size,
+            max_length=args.max_length, task_stream=stream, seed=0, shuffled=False,
+            zero_latents=False)
         cond4 = sum(r["loss"] for r in records) / len(records)
         assert trained == pytest.approx(cond4, abs=1e-5)
         assert abs(trained - with_prose) > 1e-3

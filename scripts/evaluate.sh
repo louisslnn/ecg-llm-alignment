@@ -13,7 +13,10 @@
 # Same venv, model dir and module stack as scripts/train.sh; checkpoints and eval
 # outputs live on scratch. Pass extra flags straight through:
 #   sbatch scripts/evaluate.sh --limit 500
+#   RUN=run2 TASK_STREAM=question sbatch scripts/evaluate.sh   # checkpoints/run2_question
 #   CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt sbatch scripts/evaluate.sh
+# --limit N is a seeded draw (--sample-seed, --stratify; default N/5 per superclass,
+# half Yes and half No), not the head of the split.
 #
 # THE CONTROLS -- run these too, and read them next to the main run:
 #   sbatch scripts/evaluate.sh --shuffle-embeddings     # wrong ECG per record
@@ -40,12 +43,38 @@
 # Submit from the repo root after `mkdir -p logs`.
 set -euo pipefail
 
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
+
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
 # file quota and the student checkpoint is ~28 GB of safetensors. Override either
 # with an env var if yours live elsewhere.
 VENV="${VENV:-$HOME/scratch/ecg/venv}"
 MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}"
+
+# Checkpoints are written to scratch by train.sh, one directory per RUN and task
+# stream, tagged by scripts/stream_tag.sh: RUN=run2 TASK_STREAM=question trained
+# into checkpoints/run2_question. Pass the same two here and this script finds it;
+# both default as train.sh's do. TASK_STREAM only locates the directory -- what the
+# resampler reads is still the checkpoint's own record (--task-stream overrides).
+# best.pt is the lowest val loss. Run 1 predates the convention and sits in the
+# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
+TASK_STREAM="${TASK_STREAM:-prompt}"
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
+RUN="${RUN:-run2}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN$STREAM_TAG}"
+CKPT="${CKPT:-$CKPT_DIR/best.pt}"
+# The Python side accepts a directory holding best.pt as well as a file.
+CKPT_FILE="$CKPT"
+[[ -d "$CKPT" ]] && CKPT_FILE="$CKPT/best.pt"
 
 # Checked here, before the module load, so a wrong path fails in a second naming
 # the path -- not as `activate: No such file` further down, or as a transformers
@@ -54,22 +83,16 @@ MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}
 missing=""
 [[ -f "$VENV/bin/activate" ]] || missing+="  venv (no bin/activate): $VENV"$'\n'
 [[ -f "$MODEL_DIR/config.json" ]] || missing+="  model dir (no config.json): $MODEL_DIR"$'\n'
+[[ -f "$CKPT_FILE" ]] || missing+="  resampler checkpoint: $CKPT_FILE"$'\n'
 if [[ -n "$missing" ]]; then
     echo "missing input path(s):" >&2
     printf '%s' "$missing" >&2
-    echo "pass VENV=... MODEL_DIR=... or run scripts/setup_narval.sh on a login node" >&2
+    echo "pass VENV=... MODEL_DIR=... CKPT=... (or RUN=... TASK_STREAM=... as" \
+         "train.sh was given), or run scripts/setup_narval.sh on a login node" >&2
     exit 2
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-# Checkpoints are written to scratch by train.sh, one directory per RUN; best.pt
-# is the lowest val loss. RUN must match the training run you mean to evaluate --
-# the default follows train.sh's default, so `sbatch scripts/train.sh` and this
-# script agree without being told. Run 1 predates the convention and sits in the
-# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
-RUN="${RUN:-run2}"
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN}"
-CKPT="${CKPT:-$CKPT_DIR/best.pt}"
 # Generations + metrics land on scratch too (project space is at its file quota).
 EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval/$RUN}"
 SPLIT="${SPLIT:-test}"
@@ -84,13 +107,12 @@ for arg in "$@"; do
     [[ "$arg" == "--shuffle-embeddings" ]] && SUFFIX="${SUFFIX}_shuffled"
     [[ "$arg" == "--zero-latents" ]] && SUFFIX="${SUFFIX}_zeroed"
     [[ "$arg" == "--teacher-forced-loss" ]] && SUFFIX="${SUFFIX}_teacher_forced"
-    # The resampler's task stream is part of the experiment's identity. Only the
-    # non-default is tagged, so a prompt-only run keeps the plain name -- WHICH MEANS
-    # it lands on a file an older, prompt-and-target run may already hold. Move those
-    # aside or pass OUT= if you still need them.
-    [[ "$prev" == "--task-stream" && "$arg" == "prompt-and-target" ]] \
-        && SUFFIX="${SUFFIX}_withtarget"
-    [[ "$arg" == "--task-stream=prompt-and-target" ]] && SUFFIX="${SUFFIX}_withtarget"
+    # An explicit --task-stream is part of the experiment's identity, tagged as
+    # train.sh tags checkpoint dirs (scripts/stream_tag.sh); prompt keeps the plain
+    # name. Unset, the run reads the checkpoint's own stream, which the directory
+    # already names.
+    [[ "$prev" == "--task-stream" ]] && SUFFIX="${SUFFIX}$(stream_tag "$arg")"
+    [[ "$arg" == --task-stream=* ]] && SUFFIX="${SUFFIX}$(stream_tag "${arg#*=}")"
     prev="$arg"
 done
 OUT="${OUT:-$EVAL_DIR/eval_${SPLIT}${SUFFIX}.jsonl}"

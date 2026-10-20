@@ -15,6 +15,7 @@
 # and scripts/evaluate.sh. Pass extra flags straight through:
 #   sbatch scripts/probe_latents.sh
 #   sbatch scripts/probe_latents.sh --question-mode fixed
+#   RUN=run2 TASK_STREAM=question sbatch scripts/probe_latents.sh    # checkpoints/run2_question
 #   CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch scripts/probe_latents.sh
 #
 # THE HOUR IS NOT ENOUGH FOR THE DEFAULT MODE. The resampler is multi-modal, so its
@@ -44,13 +45,24 @@
 # Each question mode writes its own JSON (and in fixed mode, each question), as do
 # --task-text prompt-and-target and the --shuffle-embeddings / --shuffle-labels
 # controls, so a null run can never overwrite the number it is the null for:
-#   probe_latents_pooled.json                  the run
+#   probe_latents_pooled.json                  the run, prompt stream
 #   probe_latents_pooled_shuflab.json          its label-shuffle control
-#   probe_latents_pooled_withtarget.json       training's own task-text stream
+#   probe_latents_pooled_question.json         a checkpoint trained on the question
+#   probe_latents_pooled_withtarget.json       --task-text prompt-and-target
+# The stream is the checkpoint's own unless --task-text says otherwise, and is
+# tagged as train.sh tags checkpoint dirs (scripts/stream_tag.sh). Files written
+# before that, for a question-stream checkpoint, say _withtarget and are misnamed.
 #
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 # Submit from the repo root after `mkdir -p logs`.
 set -euo pipefail
+
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
@@ -59,6 +71,25 @@ set -euo pipefail
 VENV="${VENV:-$HOME/scratch/ecg/venv}"
 MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}"
 
+# Checkpoints are written to scratch by train.sh, one directory per RUN and task
+# stream, tagged by scripts/stream_tag.sh: RUN=run2 TASK_STREAM=question trained
+# into checkpoints/run2_question. Pass the same two here and this script finds it;
+# both default as train.sh's do. TASK_STREAM only locates the directory -- what the
+# resampler reads is still the checkpoint's own record (--task-stream overrides).
+# best.pt is the lowest val loss. Run 1 predates the convention and sits in the
+# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
+TASK_STREAM="${TASK_STREAM:-prompt}"
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
+RUN="${RUN:-run2}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN$STREAM_TAG}"
+CKPT="${CKPT:-$CKPT_DIR/best.pt}"
+# The Python side accepts a directory holding best.pt as well as a file.
+CKPT_FILE="$CKPT"
+[[ -d "$CKPT" ]] && CKPT_FILE="$CKPT/best.pt"
+
 # Checked here, before the module load, so a wrong path fails in a second naming
 # the path -- not as `activate: No such file` further down, or as a transformers
 # traceback minutes into loading the 14B. Both report the file actually needed:
@@ -66,22 +97,16 @@ MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}
 missing=""
 [[ -f "$VENV/bin/activate" ]] || missing+="  venv (no bin/activate): $VENV"$'\n'
 [[ -f "$MODEL_DIR/config.json" ]] || missing+="  model dir (no config.json): $MODEL_DIR"$'\n'
+[[ -f "$CKPT_FILE" ]] || missing+="  resampler checkpoint: $CKPT_FILE"$'\n'
 if [[ -n "$missing" ]]; then
     echo "missing input path(s):" >&2
     printf '%s' "$missing" >&2
-    echo "pass VENV=... MODEL_DIR=... or run scripts/setup_narval.sh on a login node" >&2
+    echo "pass VENV=... MODEL_DIR=... CKPT=... (or RUN=... TASK_STREAM=... as" \
+         "train.sh was given), or run scripts/setup_narval.sh on a login node" >&2
     exit 2
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-# Checkpoints are written to scratch by train.sh, one directory per RUN; best.pt
-# is the lowest val loss. RUN must match the training run you mean to probe -- the
-# default follows train.sh's default, so `sbatch scripts/train.sh` and this script
-# agree without being told. Run 1 predates the convention and sits in the flat
-# directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
-RUN="${RUN:-run2}"
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN}"
-CKPT="${CKPT:-$CKPT_DIR/best.pt}"
 # Output lands on scratch too (project space is at its file quota).
 EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval/$RUN}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -93,7 +118,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 # own (pooled, and NORM for the fixed question).
 MODE="pooled"
 QUESTION="NORM"
-TASK_TEXT="prompt"
+TASK_TEXT=""          # unset: the checkpoint's own, resolved below
 CONTROLS=""
 prev=""
 for arg in "$@"; do
@@ -115,17 +140,31 @@ if [[ "$MODE" == "fixed" ]]; then
     TAG="fixed_$QUESTION"
     SHOWN="fixed ($QUESTION)"
 fi
-# The task-text stream and the controls are part of the experiment's identity too: a
-# null run must never land on the file holding the number it is the null for.
-[[ "$TASK_TEXT" == "prompt" ]] || TAG="${TAG}_withtarget"
-TAG="${TAG}${CONTROLS}"
-OUT="${OUT:-$EVAL_DIR/probe_latents_${TAG}.json}"
 
 source "$VENV/bin/activate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1   # no network on compute nodes
 mkdir -p "$EVAL_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
+# Unset, --task-text is what probe_latents.py will resolve it to: the checkpoint's
+# recorded --task-stream, or prompt for one with no record. Asked of the same
+# function (evaluate.checkpoint_task_stream) so the filename names the stream the
+# probe actually feeds.
+if [[ -z "$TASK_TEXT" ]]; then
+    TASK_TEXT="$(python -c 'import sys; sys.path[:0] = ["scripts", "."]
+from evaluate import checkpoint_task_stream
+print(checkpoint_task_stream(sys.argv[1]) or "prompt")' "$CKPT")"
+fi
+# The task-text stream and the controls are part of the experiment's identity too: a
+# null run must never land on the file holding the number it is the null for. The
+# stream's tag is train.sh's (scripts/stream_tag.sh): _question, _notext,
+# _withtarget, nothing for prompt.
+TEXT_TAG="$(stream_tag "$TASK_TEXT")" || {
+    echo "--task-text must be $STREAM_MODES, got '$TASK_TEXT'" >&2
+    exit 2
+}
+TAG="${TAG}${TEXT_TAG}${CONTROLS}"
+OUT="${OUT:-$EVAL_DIR/probe_latents_${TAG}.json}"
 echo "host: $(hostname)   run: $RUN   ckpt: $CKPT"
 echo "mode: $SHOWN   task-text: $TASK_TEXT   out: $OUT"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv

@@ -37,6 +37,9 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# MARKER, decision_index and tokenise_target are re-exported: older callers import
+# them from here.
+from decision_token import MARKER, decision_index, tokenise_target  # noqa: E402,F401
 from eval_controls import CONDITIONS, _pct_gap, assert_same_examples  # noqa: E402
 from evaluate import read_jsonl  # noqa: E402
 from src.data.dataset import (  # noqa: E402
@@ -47,13 +50,6 @@ from src.data.dataset import (  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 
 NAMES = [name for name, _ in CONDITIONS]
-
-MARKER = "Conclusion:"
-
-# The sweep's own teacher-forced means over the whole target (mean over examples),
-# printed beside the decision-token means. The same quantity is recomputed from the
-# files, so a mismatch says these are not the files those numbers came from.
-SEQUENCE_MEAN_KNOWN = {"real": 2.0248, "shuffled": 2.0781, "zeroed": 3.2975}
 
 # A constant-Yes model puts ~all its mass on " Yes" whatever the ECG: loss near zero
 # where the target says Yes, several nats where it says No.
@@ -73,6 +69,13 @@ def parse_args():
                     help="local student checkpoint dir, for the tokenizer only "
                          "(local_files_only); default loads it by hub name")
     ap.add_argument("--teacher", default=None, help="teacher jsonl (default: the dataset's)")
+    ap.add_argument("--known-sequence-mean", type=float, nargs=3, default=None,
+                    metavar=("REAL", "SHUFFLED", "ZEROED"),
+                    help="the sweep's own whole-target means (its summary JSON's "
+                         "teacher_forced.<condition>.mean_loss), printed beside the "
+                         "means recomputed from the files; a difference beyond 5e-4 "
+                         "says these are not the files those numbers came from. "
+                         "Omitted, the row and the check are left out")
     ap.add_argument("--show", type=int, default=10,
                     help="records to print the decoded decision token for")
     return ap.parse_args()
@@ -84,28 +87,6 @@ def load_tokenizer(model_dir):
 
         return AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     return load_student_tokenizer(DatasetConfig())
-
-
-def tokenise_target(tokenizer, text):
-    """Target ids exactly as make_collate_fn builds them, plus each token's char span."""
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    ids = list(enc.input_ids)
-    if tokenizer.eos_token_id is not None:
-        ids = ids + [tokenizer.eos_token_id]
-    return ids, enc.offset_mapping
-
-
-def decision_index(text, offsets):
-    """Index of the first token after the marker, or (None, why) if it is ambiguous."""
-    if text.count(MARKER) != 1:
-        return None, f"{text.count(MARKER)} occurrences of {MARKER!r}"
-    end = text.index(MARKER) + len(MARKER)
-    for k, (s, e) in enumerate(offsets):
-        if e > end:
-            if s < end:
-                return None, "a token straddles the end of the marker"
-            return k, None
-    return None, "no token after the marker"
 
 
 def fail_alignment(failures, n_checked):
@@ -213,18 +194,21 @@ def main():
     print(f"MEAN LOSS over {len(ref)} examples")
     print("=" * line_w)
     print(f"{'':<26}" + "".join(f"{n:>11}" for n in NAMES) + f"{'real vs shuf':>14}")
-    for label, values in (("sequence mean, known", SEQUENCE_MEAN_KNOWN),
-                          ("sequence mean, these files", seq),
-                          ("DECISION TOKEN", dec_mean)):
+    known = (dict(zip(NAMES, args.known_sequence_mean))
+             if args.known_sequence_mean else None)
+    rows = ([("sequence mean, known", known)] if known else []) + [
+        ("sequence mean, these files", seq), ("DECISION TOKEN", dec_mean)]
+    for label, values in rows:
         gap = _pct_gap(values["real"], values["shuffled"])
         print(f"{label:<26}" + "".join(f"{values[n]:>11.4f}" for n in NAMES)
               + f"{gap:>+13.1f}%")
     print(f"  decision token, shuffled - real: {dec_mean['shuffled'] - dec_mean['real']:+.4f} "
           f"nats (sequence mean: {seq['shuffled'] - seq['real']:+.4f})")
-    drift = [n for n in NAMES if abs(seq[n] - SEQUENCE_MEAN_KNOWN[n]) > 5e-4]
+    drift = [n for n in NAMES if known and abs(seq[n] - known[n]) > 5e-4]
     if drift:
-        print(f"  NOTE: sequence mean differs from the known value for {', '.join(drift)}; "
-              "these are\n        not the files the known numbers came from.")
+        print(f"  NOTE: sequence mean differs from --known-sequence-mean for "
+              f"{', '.join(drift)}; these are\n        not the files those numbers "
+              "came from.")
 
     groups = [("all", np.ones(len(ref), dtype=bool)),
               ("label True", labels), ("label False", ~labels)]

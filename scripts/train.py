@@ -107,7 +107,7 @@ from probe_memory import (  # noqa: E402  -- reuse the validated splice + checks
     load_student,
     splice_forward,
 )
-from yn_token_loss import MARKER, decision_index, tokenise_target  # noqa: E402
+from decision_token import MARKER, decision_index, tokenise_target  # noqa: E402
 
 GiB = 1024 ** 3
 
@@ -524,7 +524,7 @@ def make_decision_collate(tokenizer, collate):
     probe_memory.splice_forward, after that mask is taken; this only says where.
 
     ``decision_mask`` is bool, shaped like ``labels``, with exactly one True per row:
-    the Yes/No token after "Conclusion:", found with yn_token_loss's locator on the
+    the Yes/No token after "Conclusion:", found with decision_token's locator on the
     target rebuilt by tokenise_target -- the pair the gate's condition 3 uses, and
     the same guard. The rebuilt target must be the supervised span token for token
     (so a target --max-length cut short fails here, where --loss-on all would train

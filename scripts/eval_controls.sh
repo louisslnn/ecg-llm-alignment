@@ -4,12 +4,14 @@
 #SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --job-name=ecg-controls
 #SBATCH --output=logs/eval_controls_%j.log
 #
 # The control sweep in ONE job: three conditions (real, shuffled ECGs, zeroed
-# prefix), each both generated and teacher-forced, on a single load of the 14B.
+# prefix), each scored in fast mode, teacher-forced and generated, on a single load
+# of the 14B. Fast mode is p(Yes) after the prompt and "Conclusion:" alone, over the
+# whole split by default, with per-superclass metrics; see eval_controls.py.
 #
 # The teacher-forced table carries the mean and the per-position buckets for all
 # three conditions with a per-bucket real-vs-shuffled gap, and below it the same
@@ -21,14 +23,19 @@
 # Same venv, model dir and module stack as scripts/train.sh and scripts/evaluate.sh.
 # Pass extra flags straight through:
 #   sbatch scripts/eval_controls.sh
-#   sbatch scripts/eval_controls.sh --limit 100 --tf-limit 500
+#   RUN=run2 TASK_STREAM=question sbatch scripts/eval_controls.sh   # checkpoints/run2_question
+#   sbatch scripts/eval_controls.sh --limit 100 --tf-limit 500 --skip-zeroed-generation
 #   CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/ckpt_step5000.pt sbatch scripts/eval_controls.sh
+# Every limited pass is a seeded draw (--sample-seed, --stratify; default N/5 per
+# superclass, half Yes and half No), printed with its positive rates.
 #
-# The hour: 3 x 50 generations at batch 1 is ~150 decodes of a few hundred greedy
-# tokens each, which is the bulk of the time; the teacher-forced sweep is now 3 x 200
-# forward passes rather than one pass of 200, which is still only a few minutes, and
-# the model load a few more. That fits an hour with room to spare, but raising
-# --limit raises it close to linearly -- 3 x 200 generations will not fit.
+# The two hours: ~15 min for the model load; fast mode over the whole test split,
+# 3 x 10,985 forwards at 20+/s, ~30 min; the teacher-forced sweep, 3 x 200 forwards,
+# a few minutes; and 3 x 50 generations at batch 1, ~150 decodes of a few hundred
+# greedy tokens at ~0.15/s, the rest. Fast mode runs first, so its files are written
+# whatever happens after. Raising --limit raises the decode time close to linearly;
+# --skip-zeroed-generation takes out a third of it (the zeroed decode is a known
+# 100% parse failure), and --skip-fast or --fast-limit takes out fast mode's share.
 # Batch 1 is deliberate: it keeps each condition's decode independent of how a batch
 # happened to be padded, which is what makes the byte-identical comparison trustworthy.
 #
@@ -39,12 +46,38 @@
 # Submit from the repo root after `mkdir -p logs`.
 set -euo pipefail
 
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
+
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
 # file quota and the student checkpoint is ~28 GB of safetensors. Override either
 # with an env var if yours live elsewhere.
 VENV="${VENV:-$HOME/scratch/ecg/venv}"
 MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}"
+
+# Checkpoints are written to scratch by train.sh, one directory per RUN and task
+# stream, tagged by scripts/stream_tag.sh: RUN=run2 TASK_STREAM=question trained
+# into checkpoints/run2_question. Pass the same two here and this script finds it;
+# both default as train.sh's do. TASK_STREAM only locates the directory -- what the
+# resampler reads is still the checkpoint's own record (--task-stream overrides).
+# best.pt is the lowest val loss. Run 1 predates the convention and sits in the
+# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
+TASK_STREAM="${TASK_STREAM:-prompt}"
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
+RUN="${RUN:-run2}"
+CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN$STREAM_TAG}"
+CKPT="${CKPT:-$CKPT_DIR/best.pt}"
+# The Python side accepts a directory holding best.pt as well as a file.
+CKPT_FILE="$CKPT"
+[[ -d "$CKPT" ]] && CKPT_FILE="$CKPT/best.pt"
 
 # Checked here, before the module load, so a wrong path fails in a second naming
 # the path -- not as `activate: No such file` further down, or as a transformers
@@ -53,22 +86,16 @@ MODEL_DIR="${MODEL_DIR:-$HOME/scratch/ecg/hf_cache/DeepSeek-R1-Distill-Qwen-14B}
 missing=""
 [[ -f "$VENV/bin/activate" ]] || missing+="  venv (no bin/activate): $VENV"$'\n'
 [[ -f "$MODEL_DIR/config.json" ]] || missing+="  model dir (no config.json): $MODEL_DIR"$'\n'
+[[ -f "$CKPT_FILE" ]] || missing+="  resampler checkpoint: $CKPT_FILE"$'\n'
 if [[ -n "$missing" ]]; then
     echo "missing input path(s):" >&2
     printf '%s' "$missing" >&2
-    echo "pass VENV=... MODEL_DIR=... or run scripts/setup_narval.sh on a login node" >&2
+    echo "pass VENV=... MODEL_DIR=... CKPT=... (or RUN=... TASK_STREAM=... as" \
+         "train.sh was given), or run scripts/setup_narval.sh on a login node" >&2
     exit 2
 fi
 
 module load StdEnv/2023 python/3.11 cuda
-# Checkpoints are written to scratch by train.sh, one directory per RUN; best.pt
-# is the lowest val loss. RUN must match the training run you mean to evaluate --
-# the default follows train.sh's default, so `sbatch scripts/train.sh` and this
-# script agree without being told. Run 1 predates the convention and sits in the
-# flat directory:  CKPT=$SCRATCH/ecg-llm-alignment/checkpoints/best.pt RUN=run1 sbatch ...
-RUN="${RUN:-run2}"
-CKPT_DIR="${CKPT_DIR:-$SCRATCH/ecg-llm-alignment/checkpoints/$RUN}"
-CKPT="${CKPT:-$CKPT_DIR/best.pt}"
 # Outputs land on scratch too (project space is at its file quota).
 EVAL_DIR="${EVAL_DIR:-$SCRATCH/ecg-llm-alignment/eval/$RUN}"
 SPLIT="${SPLIT:-test}"

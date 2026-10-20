@@ -115,6 +115,13 @@
 # Compute nodes have NO internet: run scripts/setup_narval.sh on a login node first.
 set -euo pipefail
 
+# The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
+# script that names a run's directory. sbatch runs a spooled copy of this file, so
+# it is found from the submit directory (the repo root), not from $0.
+LIB="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/scripts/stream_tag.sh"
+[[ -f "$LIB" ]] || { echo "missing $LIB: submit from the repo root" >&2; exit 2; }
+source "$LIB"
+
 DEFAULT_STEPS=400
 # Mirrors train.py's own overfit default (it picks 1e-4 when --overfit is set, 1e-5
 # otherwise). Passing it explicitly is what lets the tag name the LR that ran; if
@@ -252,16 +259,10 @@ fi
 [[ "$LOSS_ON" == "all" ]] || TAG+="_$LOSS_ON"
 [[ "$OVERFIT_SELECT" == "head" ]] || TAG+="_$OVERFIT_SELECT"
 TASK_STREAM="${TASK_STREAM:-prompt}"
-case "$TASK_STREAM" in
-    prompt)            STREAM_TAG="" ;;
-    prompt-and-target) STREAM_TAG="_withtarget" ;;
-    question)          STREAM_TAG="_question" ;;
-    none)              STREAM_TAG="_notext" ;;
-    *)
-        echo "TASK_STREAM must be prompt, prompt-and-target, question or none," \
-             "got '$TASK_STREAM'" >&2
-        exit 2 ;;
-esac
+STREAM_TAG="$(stream_tag "$TASK_STREAM")" || {
+    echo "TASK_STREAM must be $STREAM_MODES, got '$TASK_STREAM'" >&2
+    exit 2
+}
 TAG+="$STREAM_TAG"
 # Caught again in train.py; repeated here so it fails in seconds, before the module
 # load and the 14B, instead of after.

@@ -64,7 +64,8 @@ so ``--from-jsonl`` recomputes the whole metrics table without touching a GPU.
     # full test split
     python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt
 
-    # 500 examples, quick look
+    # 500 examples, quick look: a seeded draw, 100 per superclass, half Yes and half
+    # No (--stratify, --sample-seed), never the head of the split
     python scripts/evaluate.py --model-dir $MODEL_DIR --ckpt $CKPT_DIR/best.pt --limit 500
 
     # the controls (each writes its own default filename, so neither can overwrite
@@ -124,6 +125,7 @@ from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E40
 from src.teacher import parse as teacher_parse  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 from probe_memory import load_student  # noqa: E402  -- the same student loader as training
+from decision_token import MARKER, decision_index, tokenise_target  # noqa: E402
 
 # The target format every block ends with (src/teacher/prompt.py MODE_B_TEMPLATE).
 END_MARKER = "<END>"
@@ -144,8 +146,19 @@ def parse_args():
                     help="resampler checkpoint (.pt file, or a dir holding best.pt)")
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--limit", type=int, default=None,
-                    help="evaluate only the first N examples of the split "
-                         "(dataset order: N/5 records, all five superclasses each)")
+                    help="evaluate a seeded draw of N examples (--stratify, "
+                         "--sample-seed) rather than the whole split. Never the first "
+                         "N: the split is ordered by record and its head is not a "
+                         "sample (fold 10's is heavily normal)")
+    ap.add_argument("--sample-seed", type=int, default=42,
+                    help="seed for the --limit draw; separate from --seed, which "
+                         "seeds the embedding permutation")
+    ap.add_argument("--stratify", choices=STRATIFY_MODES, default=DEFAULT_STRATIFY,
+                    help="how --limit draws: 'superclass-label' (default) takes N/5 "
+                         "per superclass, half Yes and half No; 'superclass' N/5 per "
+                         "superclass, uniform within; 'none' uniform over the split. "
+                         "The realised positive rate per superclass is printed beside "
+                         "the split's")
     ap.add_argument("--batch-size", type=int, default=8,
                     help="generation batch size (prompts are left-padded)")
     ap.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -318,7 +331,13 @@ def metrics_for(records: Sequence[dict]) -> Dict[str, object]:
     return out
 
 
-def compute_all_metrics(records: Sequence[dict]) -> Dict[str, Dict[str, object]]:
+# The METRICS table's rows, in print order. Every metrics table groups by these, so
+# the generation and fast-mode tables line up row for row.
+METRIC_GROUPS = (["overall"] + list(SUPERCLASSES)
+                 + ["NORM (normal subset)", "abnormal subset"])
+
+
+def metric_groups(records: Sequence[dict]) -> Dict[str, List[dict]]:
     groups: Dict[str, List[dict]] = {"overall": list(records)}
     for sc in SUPERCLASSES:
         groups[sc] = [r for r in records if r["superclass"] == sc]
@@ -326,7 +345,79 @@ def compute_all_metrics(records: Sequence[dict]) -> Dict[str, Dict[str, object]]
     # the four abnormal questions pooled.
     groups["NORM (normal subset)"] = [r for r in records if r["superclass"] == "NORM"]
     groups["abnormal subset"] = [r for r in records if r["superclass"] in ABNORMAL]
-    return {name: metrics_for(rs) for name, rs in groups.items()}
+    return groups
+
+
+def compute_all_metrics(records: Sequence[dict]) -> Dict[str, Dict[str, object]]:
+    return {name: metrics_for(rs) for name, rs in metric_groups(records).items()}
+
+
+# Fast mode's fixed operating point: Yes when p_yes >= this.
+FAST_THRESHOLD = 0.5
+
+
+def best_f1_threshold(y_true: np.ndarray, score: np.ndarray):
+    """``(threshold, prf1)``: the cut ``score >= threshold`` with the highest F1.
+
+    Every distinct score is a candidate, ties kept together as in :func:`auprc`; the
+    first maximum wins, which is the highest such threshold. Chosen on the very
+    examples it is then scored on, so it is an in-sample upper bound on F1 rather
+    than an operating point. ``(None, None)`` when there are no positives.
+    """
+    if not len(y_true) or not y_true.any():
+        return None, None
+    order = np.argsort(-score, kind="mergesort")
+    s, y = score[order], y_true[order].astype(np.float64)
+    last = np.r_[np.nonzero(np.diff(s))[0], len(s) - 1]   # last index of each tie run
+    tp = np.cumsum(y)[last]
+    pred = last + 1.0
+    f1 = 2 * tp / (pred + y.sum())
+    best = int(np.argmax(f1))
+    threshold = float(s[last[best]])
+    return threshold, _prf1(y_true, score >= threshold)
+
+
+def fast_metrics_for(records: Sequence[dict]) -> Dict[str, object]:
+    """Every fast-mode number for one group: the METRICS columns, from p_yes alone.
+
+    No parse step, so every example is scored. F1, precision and recall come twice:
+    at FAST_THRESHOLD, and at the group's own best-F1 threshold (in-sample, see
+    :func:`best_f1_threshold`).
+    """
+    n = len(records)
+    out: Dict[str, object] = {
+        "n": n, "positive_rate": None, "mean_p_yes": None,
+        "at_threshold": None, "best_f1": None,
+        "auprc": None, "auprc_lift": None, "auroc": None,
+        "n_with_loss": 0, "mean_loss": None,
+    }
+    if not n:
+        return out
+    y = np.array([bool(r["label"]) for r in records])
+    p = np.array([float(r["p_yes"]) for r in records])
+    pos_rate = float(y.mean())
+    losses = [r["loss"] for r in records if r.get("loss") is not None]
+    out.update({
+        "positive_rate": pos_rate,
+        "mean_p_yes": float(p.mean()),
+        "at_threshold": {"threshold": FAST_THRESHOLD,
+                         "predicted_positive_rate": float((p >= FAST_THRESHOLD).mean()),
+                         **_prf1(y, p >= FAST_THRESHOLD)},
+        "auroc": auroc(y, p),
+        "n_with_loss": len(losses),
+        "mean_loss": float(np.mean(losses)) if losses else None,
+    })
+    threshold, best = best_f1_threshold(y, p)
+    if best is not None:
+        out["best_f1"] = {"threshold": threshold, **best}
+    ap = auprc(y, p)
+    out["auprc"] = ap
+    out["auprc_lift"] = ap / pos_rate if ap is not None and pos_rate > 0 else None
+    return out
+
+
+def compute_fast_metrics(records: Sequence[dict]) -> Dict[str, Dict[str, object]]:
+    return {name: fast_metrics_for(rs) for name, rs in metric_groups(records).items()}
 
 
 def _fmt(v, width=6, prec=3):
@@ -336,7 +427,7 @@ def _fmt(v, width=6, prec=3):
 
 
 def print_metrics(table: Dict[str, Dict[str, object]]) -> None:
-    order = (["overall"] + SUPERCLASSES + ["NORM (normal subset)", "abnormal subset"])
+    order = METRIC_GROUPS
     name_w = max(len(n) for n in order)
     header = (f"{'group':<{name_w}}  {'n':>6} {'unpars':>6} {'pos_rt':>6} "
               f"{'F1':>6} {'prec':>6} {'rec':>6} {'AUPRC':>6} {'lift':>6} {'AUROC':>6}")
@@ -357,6 +448,151 @@ def print_metrics(table: Dict[str, Dict[str, object]]) -> None:
     print("-" * len(header))
     print("AUPRC has no fixed floor: read it against pos_rt (lift = AUPRC / positive "
           "rate of the scored subset; lift 1.0 is chance).")
+
+
+def print_fast_metrics(table: Dict[str, Dict[str, object]], title: str = "") -> None:
+    """Fast mode's table: the METRICS rows and columns, F1 at two thresholds."""
+    name_w = max(len(n) for n in METRIC_GROUPS)
+    header = (f"{'group':<{name_w}}  {'n':>6} {'pos_rt':>6} {'p_yes':>6} | "
+              f"{'F1@.5':>6} {'prec':>6} {'rec':>6} | "
+              f"{'F1*':>6} {'thr*':>6} {'prec*':>6} {'rec*':>6} | "
+              f"{'AUPRC':>6} {'lift':>6} {'AUROC':>6}")
+    print("\n" + "=" * len(header))
+    print("FAST-MODE METRICS  (p_yes after the prompt and \"Conclusion:\" alone; "
+          "every example scored)" + (f"  -- {title}" if title else ""))
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for name in METRIC_GROUPS:
+        m = table[name]
+        if name == "NORM (normal subset)":
+            print("-" * len(header))
+        at = m["at_threshold"] or {}
+        best = m["best_f1"] or {}
+        print(f"{name:<{name_w}}  {m['n']:>6} {_fmt(m['positive_rate'])} "
+              f"{_fmt(m['mean_p_yes'])} | {_fmt(at.get('f1'))} "
+              f"{_fmt(at.get('precision'))} {_fmt(at.get('recall'))} | "
+              f"{_fmt(best.get('f1'))} {_fmt(best.get('threshold'))} "
+              f"{_fmt(best.get('precision'))} {_fmt(best.get('recall'))} | "
+              f"{_fmt(m['auprc'])} {_fmt(m['auprc_lift'], prec=2)} {_fmt(m['auroc'])}")
+    print("-" * len(header))
+    print(f"@.5: Yes when p_yes >= {FAST_THRESHOLD:g}, the same cut for every row.")
+    print("*:   each row's own best-F1 threshold (thr*), chosen ON THESE EXAMPLES -- an "
+          "in-sample upper\n     bound on F1, not an operating point to quote.")
+    print("AUPRC against pos_rt as above (lift 1.0 is chance). On a balanced draw "
+          "pos_rt is ~0.5 by\nconstruction, so precision and AUPRC are at that "
+          "prevalence, not the split's.")
+
+
+# --------------------------------------------------------------------------- #
+# Which examples. A --limit is a draw, never the head of the split: the split is  #
+# ordered by record, and its first examples are not a sample of anything.       #
+# --------------------------------------------------------------------------- #
+
+STRATIFY_MODES = ("none", "superclass", "superclass-label")
+DEFAULT_STRATIFY = "superclass-label"
+
+
+def _quotas(n: int, k: int) -> List[int]:
+    """``n`` split over ``k`` cells as evenly as integers allow, extras first."""
+    return [n // k + (1 if i < n % k else 0) for i in range(k)]
+
+
+def sample_indices(dataset, n: Optional[int], seed: int,
+                   stratify: str = DEFAULT_STRATIFY):
+    """``(indices, info)``: a seeded draw of ``n`` examples, in dataset order.
+
+    ``n`` None, or at least the split's size, is the whole split and draws nothing.
+    Otherwise, by ``stratify``:
+
+        none              a uniform draw over the split
+        superclass        ``n`` spread evenly over the five superclasses, uniform
+                          within each
+        superclass-label  the same, and within each superclass half Yes and half No
+
+    Each cell (a superclass, or a superclass and label) is permuted once with one
+    ``np.random.default_rng(seed)`` in a fixed order, and its quota is taken from the
+    front, so the draw depends on the seed and the quotas alone and a smaller draw
+    with the same seed sits inside a larger one wherever no cell ran short. A cell
+    that has fewer examples than its quota gives all it has, the rest comes from its
+    sibling label where there is one, and the shortfall goes into ``info``. The
+    result is sorted, so every condition handed these indices covers the same
+    examples in the same order.
+    """
+    if stratify not in STRATIFY_MODES:
+        raise ValueError(f"unknown stratify {stratify!r}; have {STRATIFY_MODES}")
+    examples = base_of(dataset).examples
+    total = len(examples)
+    info: Dict[str, Any] = {"stratify": stratify, "sample_seed": seed,
+                            "n_requested": n, "shortfalls": []}
+    if n is None or n >= total:
+        info.update(stratify="whole split", n_drawn=total)
+        return list(range(total)), info
+    rng = np.random.default_rng(seed)
+    if stratify == "none":
+        picked = rng.choice(total, size=n, replace=False).tolist()
+    else:
+        picked = []
+        for sc, quota in zip(SUPERCLASSES, _quotas(n, len(SUPERCLASSES))):
+            in_class = [i for i, e in enumerate(examples) if e.superclass == sc]
+            if stratify == "superclass":
+                cell = rng.permutation(in_class).tolist()
+                if len(cell) < quota:
+                    info["shortfalls"].append(f"{sc}: {len(cell)} of {quota}")
+                picked += cell[:quota]
+                continue
+            cells = {label: rng.permutation(
+                [i for i in in_class if bool(examples[i].label) == label]).tolist()
+                for label in (True, False)}
+            want = dict(zip((True, False), _quotas(quota, 2)))
+            for label in (True, False):
+                short = want[label] - len(cells[label])
+                if short > 0:          # what one label lacks, the other gives
+                    info["shortfalls"].append(
+                        f"{sc} label={label}: {len(cells[label])} of {want[label]}")
+                    want[label] -= short
+                    want[not label] += short
+            if len(in_class) < quota:
+                info["shortfalls"].append(f"{sc}: {len(in_class)} of {quota}")
+            for label in (True, False):
+                picked += cells[label][:want[label]]
+    picked = sorted(int(i) for i in picked)
+    info["n_drawn"] = len(picked)
+    return picked, info
+
+
+def sample_rates(dataset, indices: Sequence[int]) -> Dict[str, Dict[str, Any]]:
+    """Per superclass: the draw's size and positive rate, beside the split's own."""
+    examples = base_of(dataset).examples
+    drawn = [examples[i] for i in indices]
+    out = {}
+    for sc in list(SUPERCLASSES) + ["overall"]:
+        def rate(exs):
+            exs = [e for e in exs if sc == "overall" or e.superclass == sc]
+            return len(exs), (float(np.mean([bool(e.label) for e in exs])) if exs else None)
+        n, r = rate(drawn)
+        n_split, r_split = rate(examples)
+        out[sc] = {"n": n, "positive_rate": r, "n_split": n_split,
+                   "split_positive_rate": r_split}
+    return out
+
+
+def print_sample(dataset, indices: Sequence[int], info: Dict[str, Any], what: str):
+    """The draw, said in the log: how it was made, and its positive rate per
+    superclass beside the split's, so a skewed draw is visible. Returns ``info``
+    with the rates added, for the summary JSON."""
+    rates = sample_rates(dataset, indices)
+    how = (info["stratify"] if info["stratify"] == "whole split" else
+           f"--stratify {info['stratify']}, --sample-seed {info['sample_seed']}")
+    print(f"\n{what}: {len(indices):,} examples ({how})")
+    print(f"  {'superclass':<10} {'n':>6} {'pos rate':>9} {'split rate':>11} "
+          f"{'split n':>8}")
+    for sc, r in rates.items():
+        print(f"  {sc:<10} {r['n']:>6} {_fmt(r['positive_rate'], width=9)} "
+              f"{_fmt(r['split_positive_rate'], width=11)} {r['n_split']:>8}")
+    for s in info["shortfalls"]:
+        print(f"  SHORT: {s} -- the draw is not balanced there")
+    return {**info, "rates": rates}
 
 
 # --------------------------------------------------------------------------- #
@@ -603,7 +839,8 @@ def checkpoint_task_stream(ckpt_path: str) -> Optional[str]:
     return meta.get("task_stream") if isinstance(meta, dict) else None
 
 
-def resolve_task_stream(ckpt_path: str, requested: Optional[str]) -> str:
+def resolve_task_stream(ckpt_path: str, requested: Optional[str],
+                        flag: str = "--task-stream") -> str:
     """The task stream an evaluation runs with, and where it came from, printed.
 
     An explicit --task-stream wins, so a deliberate comparison (run 1's
@@ -611,7 +848,8 @@ def resolve_task_stream(ckpt_path: str, requested: Optional[str]) -> str:
     checkpoint is printed, not refused. Unset, it is the checkpoint's own mode: a
     resampler trained on the question alone is never silently handed the full
     prompt. A checkpoint with no record gets 'prompt', the default every evaluation
-    before the record used.
+    before the record used. ``flag`` is the caller's name for the option, for the
+    log line (probe_latents.py calls it --task-text).
     """
     trained = checkpoint_task_stream(ckpt_path)
     if requested is None:
@@ -619,7 +857,7 @@ def resolve_task_stream(ckpt_path: str, requested: Optional[str]) -> str:
         source = ("recorded in the checkpoint" if trained else
                   "the checkpoint has no record, so the pre-record default")
     else:
-        mode, source = requested, "--task-stream"
+        mode, source = requested, flag
     print(f"resampler task stream: {mode} ({source})", flush=True)
     if trained and mode != trained:
         print(f"  NOTE: the checkpoint trained with --task-stream {trained}; this run "
@@ -1396,6 +1634,137 @@ def run_teacher_forced(ctx: EvalContext, dataset, indices: Sequence[int], *,
 
 
 # --------------------------------------------------------------------------- #
+# The no-target-context decision score ("fast mode")                           #
+# --------------------------------------------------------------------------- #
+
+
+def no_context_text(tokenizer, target):
+    """``(context, decision_id, why)``: "Conclusion:" as the target spells it, and the
+    token that follows it there.
+
+    ``context`` is the target from the marker up to the decision token's first
+    character -- "Conclusion:" itself, whatever the target's spacing. It is checked
+    against the full target: tokenised on its own it must be exactly the tokens the
+    target has right before the decision token, so a probe asks for the same token
+    after the same tokens as teacher forcing and differs only in what came before
+    them. ``why`` names the problem when it cannot be built, and is None otherwise.
+    """
+    ids, offsets = tokenise_target(tokenizer, target)
+    k, why = decision_index(target, offsets)
+    if why:
+        return None, None, why
+    context = target[target.index(MARKER):offsets[k][0]]
+    own = tokenizer(context, add_special_tokens=False).input_ids
+    if not own or ids[k - len(own):k] != own:
+        return None, None, (f"{context!r} tokenises on its own as {own}, but the target "
+                            f"has {ids[max(0, k - len(own)):k]} before its decision token")
+    return context, ids[k], None
+
+
+@torch.no_grad()
+def no_context_records(model, resampler, tokenizer, dev, dataset, indices, *,
+                       batch_size: int, max_length: int, task_stream: str, seed: int,
+                       shuffled: bool, zero_latents: bool, strict: bool = True,
+                       log_every: int = 0, what: str = "no-context decision score"):
+    """The decision token after the prompt and the literal "Conclusion:" alone.
+
+    The one implementation of the no-target-context score: the overfit gate's
+    condition 4 and its --loss-on decision stop rule (scripts/overfit_gate.py) and
+    the control sweep's fast mode (scripts/eval_controls.py) all call this, so they
+    cannot drift apart.
+
+    The student reads the ECG prefix, the prompt, then MARKER -- no Evidence, no
+    Reasoning, no target text. Each example goes through training's own collate
+    with its target REPLACED by MARKER, so the prompt, the template, strip_think, the
+    question stream and the -100 masking are training's (an EOS follows, which no
+    earlier position can see). The task stream goes through task_stream_ids: under
+    ``prompt`` the MARKER tokens are target-side and the resampler does not read
+    them, as at inference. The position read is the last MARKER token, whose logits
+    predict the answer: p_yes is the logsumexp-pooled Yes against No over
+    :func:`yes_no_token_ids`, the readout generation uses.
+
+    The target is used for one thing only, the token the loss is scored against: the
+    one after "Conclusion:" in the target, located by decision_token and checked
+    by :func:`no_context_text`, and required to follow exactly MARKER as given here.
+    When it cannot be, ``strict`` (the gate) is fatal, naming the examples; otherwise
+    (an evaluation) the example keeps its p_yes, its ``loss`` is None and
+    ``target_problem`` says why. A collate that did not lay the input out as built
+    is fatal either way.
+
+    Returns the records in ``indices`` order; writes nothing.
+    """
+    collate = make_collate_fn(tokenizer, max_length=max_length,
+                              strip_think=base_of(dataset).config.strip_think)
+    yes_ids, no_ids = yes_no_token_ids(tokenizer)
+    cand = torch.tensor(yes_ids + no_ids, device=dev)
+    yes_pos = list(range(len(yes_ids)))
+    no_pos = list(range(len(yes_ids), len(yes_ids) + len(no_ids)))
+    n_ctx = len(tokenizer(MARKER, add_special_tokens=False).input_ids)
+    donors = dataset.mapping if isinstance(dataset, ShuffledEmbeddings) else None
+    records, problems, fatal = [], [], []
+    t0 = time.time()
+    for bi, start in enumerate(range(0, len(indices), batch_size)):
+        items = [dataset[i] for i in indices[start:start + batch_size]]
+        decision = []
+        for it in items:
+            context, decision_id, why = no_context_text(tokenizer, it["target"])
+            if why is None and context != MARKER:
+                why = f"the target spells the marker {context!r}, not {MARKER!r}"
+            if why:
+                problems.append(f"  {it['ecg_id']:>7} {it['superclass']:<6} {why}")
+            decision.append((None, why) if why else (decision_id, None))
+        if strict and problems:
+            continue        # fatal below; no forward for a pass that cannot finish
+        batch = collate([{**it, "target": MARKER} for it in items])
+        task_ids, task_mask = task_stream_ids(batch, task_stream)
+        full_embeds, full_attn, Lq = splice_prefix(
+            model, resampler, batch["ecg_embed"].to(dev),
+            batch["input_ids"].to(dev), batch["attention_mask"].to(dev), dev,
+            zero_latents=zero_latents, task_ids=task_ids.to(dev),
+            task_mask=task_mask.to(dev))
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(inputs_embeds=full_embeds, attention_mask=full_attn,
+                           use_cache=False).logits
+        for b, (it, (decision_id, why)) in enumerate(zip(items, decision)):
+            span = (batch["labels"][b] != -100).nonzero().flatten()
+            if len(span) != n_ctx + 1:            # MARKER, then the EOS
+                fatal.append(f"  {it['ecg_id']:>7} {it['superclass']:<6} the collate "
+                             f"laid out {len(span)} target tokens, not {n_ctx} + EOS")
+                continue
+            row = logits[b, Lq + int(span[n_ctx - 1])].float()
+            records.append({
+                "ecg_id": int(it["ecg_id"]), "superclass": it["superclass"],
+                "strat_fold": int(it["strat_fold"]),
+                "label": bool(it["label"]),
+                "loss": None if decision_id is None else float(F.cross_entropy(
+                    row[None], torch.tensor([decision_id], device=row.device))),
+                "p_yes": probability_from_logits(row[cand], yes_pos, no_pos),
+                "decision_token": (None if decision_id is None
+                                   else tokenizer.decode([decision_id])),
+                "target_problem": why,
+                "context": MARKER,
+                "shuffled_embeddings": bool(shuffled), "zero_latents": bool(zero_latents),
+                "donor_ecg_id": donors[int(it["ecg_id"])] if donors else None,
+                "task_stream": task_stream,
+                "seed": seed,
+            })
+        if log_every and (bi + 1) % log_every == 0:
+            rate = len(records) / max(time.time() - t0, 1e-9)
+            left = (len(indices) - len(records)) / max(rate, 1e-9)
+            print(f"[{len(records):>6}/{len(indices)}] {rate:.1f} ex/s  "
+                  f"eta {left / 60:.1f} min", flush=True)
+    if fatal or (strict and problems):
+        bad = fatal + (problems if strict else [])
+        sys.exit(f"{what} cannot be evaluated for {len(bad)} of {len(indices)} "
+                 "examples:\n" + "\n".join(bad))
+    if problems:
+        print(f"{what}: {len(problems)} of {len(indices)} targets have no locatable "
+              "decision token; those examples keep p_yes, with loss None:\n"
+              + "\n".join(problems[:10]) + ("\n  ..." if len(problems) > 10 else ""))
+    return records
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
@@ -1458,10 +1827,8 @@ def main():
               "same shape before the splice, so the 64-position prefix is present "
               "and attendable but carries nothing")
 
-    indices = list(range(len(dataset)))
-    if args.limit is not None:
-        indices = indices[:args.limit]
-        print(f"--limit {args.limit}: evaluating {len(indices):,} examples")
+    indices, sample = sample_indices(dataset, args.limit, args.sample_seed, args.stratify)
+    sample = print_sample(dataset, indices, sample, "evaluating")
 
     # ---- teacher-forced loss: no generation --------------------------------
     if args.teacher_forced_loss:
@@ -1485,7 +1852,8 @@ def main():
                 "zero_latents": bool(args.zero_latents),
                 "strip_think": bool(args.strip_think), **ctx.strip_think_check,
                 "task_stream": args.task_stream,
-                "seed": args.seed, "limit": args.limit, "batch_size": args.batch_size,
+                "seed": args.seed, "limit": args.limit, "sampling": sample,
+                "batch_size": args.batch_size,
                 "max_length": args.max_length, "losses": args.out,
                 "elapsed_seconds": round(elapsed, 1), "teacher_forced": summary,
             }, f, indent=2)
@@ -1538,6 +1906,7 @@ def main():
         "strip_think": bool(args.strip_think), **ctx.strip_think_check,
         "seed": args.seed,
         "limit": args.limit,
+        "sampling": sample,
         "max_new_tokens": args.max_new_tokens,
         # what the resampler read; prompt-and-target has no target here, so it read
         # the prompt

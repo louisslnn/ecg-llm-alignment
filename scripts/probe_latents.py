@@ -32,12 +32,15 @@ it the same thing everywhere:
     generation evaluate.py's make_eval_collate is prompt-only, so at inference the
                same resampler sees the prompt and nothing else.
 
---task-text picks which one this probe reproduces, and defaults to `prompt`. That is
-the honest default for a probe: with the target in the stream the latents can carry
-the label straight out of the text, and the AUPRC stops being a statement about the
-ECG at all. --task-text prompt-and-target reproduces training exactly, for when the
-question is what the resampler was trained on rather than what it can read from a
-waveform. Either way the stream is decoded and printed for one example at startup,
+--task-text picks which one this probe reproduces. Unset, it is the mode the
+checkpoint recorded (train.py's --task-stream), or `prompt` for a checkpoint that
+predates the record -- evaluate.resolve_task_stream, as eval_controls.py resolves
+it -- so a resampler trained on the question alone is probed on the question alone.
+An explicit --task-text wins, and a disagreement with the checkpoint is printed.
+With the target in the stream the latents can carry the label straight out of the
+text, and the AUPRC stops being a statement about the ECG at all;
+--task-text prompt-and-target reproduces that, for when the question is what the
+resampler was trained on rather than what it can read from a waveform. Either way the stream is decoded and printed for one example at startup,
 with the token counts of both, so the run says on its face what it fed the model.
 
 THE CONTROLS. Two nulls, both of which must land at the positive rate:
@@ -128,6 +131,7 @@ from evaluate import (  # noqa: E402
     base_of,
     load_split,
     make_eval_collate,
+    resolve_task_stream,
 )
 # The probe itself: the same LBFGS fit, the same feature transforms and the same
 # table the embedding probe prints, so the two reports can be read side by side.
@@ -158,15 +162,16 @@ def parse_args():
                          "vector; see the module docstring (default: pooled)")
     ap.add_argument("--fixed-question", default="NORM", choices=list(SUPERCLASSES),
                     help="which superclass question to use in --question-mode fixed")
-    ap.add_argument("--task-text", choices=TASK_TEXT_MODES, default="prompt",
+    ap.add_argument("--task-text", choices=TASK_TEXT_MODES, default=None,
                     help="what the resampler's task-text stream receives. 'prompt' is "
                          "the prompt alone, as generation feeds it. "
                          "'prompt-and-target' is what train.py feeds -- the prompt "
                          "AND the target, conclusion included -- and features built "
                          "that way can read the label out of the text. 'question' is "
                          "the question paraphrase alone, 'none' no text: what a "
-                         "checkpoint trained with that --task-stream reads "
-                         "(default: prompt)")
+                         "checkpoint trained with that --task-stream reads. "
+                         "Default: the mode the checkpoint recorded, or 'prompt' for "
+                         "one that predates the record; an explicit value wins")
     ap.add_argument("--variants", nargs="+", default=["centered"], choices=VARIANTS,
                     help="feature transforms to run (default: centered only)")
     ap.add_argument("--shuffle-embeddings", action="store_true",
@@ -633,6 +638,8 @@ def main():
     torch.manual_seed(args.seed)
 
     data_cfg = build_data_config(args)
+    # From the checkpoint's meta, before the student loads.
+    args.task_text = resolve_task_stream(args.ckpt, args.task_text, flag="--task-text")
     train_folds = sorted(DEFAULT_FOLD_SPLITS["train"])
     test_folds = sorted(DEFAULT_FOLD_SPLITS["test"])
     print(f"question mode: {args.question_mode}"

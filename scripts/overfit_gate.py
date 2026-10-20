@@ -20,7 +20,7 @@ has to show the same thing three ways, all on the examples the overfit trained o
        "Conclusion:" -- below 0.1 on the label=True and label=False subsets
        SEPARATELY. Separately is the point: a constant-Yes model sits near zero on
        every positive, so it passes an overall mean whenever positives dominate.
-       The token is found with scripts/yn_token_loss.py's locator, and the same
+       The token is found with scripts/decision_token.py's locator, and the same
        length check that script treats as fatal is fatal here.
 
 All three are printed with their thresholds whether they pass or not, and the
@@ -129,7 +129,6 @@ import sys
 
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812
 
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
@@ -143,18 +142,17 @@ from evaluate import (  # noqa: E402
     EvalContext,
     ShuffledEmbeddings,
     auprc,
-    probability_from_logits,
+    no_context_records,
+    no_context_text,  # used by no_context_target; the tests import it from here
     run_generation,
     run_teacher_forced,
-    splice_prefix,
     summarise_teacher_forced,
     teacher_forced_batch,
-    yes_no_token_ids,
 )
-from src.data.dataset import make_collate_fn, task_stream_ids  # noqa: E402
+from src.data.dataset import make_collate_fn  # noqa: E402
 from src.teacher.prompt import superclass_answer  # noqa: E402
 from src.teacher.view import build_view  # noqa: E402
-from yn_token_loss import MARKER, decision_index, tokenise_target  # noqa: E402
+from decision_token import MARKER, decision_index, tokenise_target  # noqa: E402
 
 # --gate-threshold is the only one of these exposed as a flag; the rest are the
 # gate's definition and are changed here, on purpose, not per submission.
@@ -659,29 +657,6 @@ def print_decision_controls(decision_by_condition, labels, donor_labels=None,
     return rows
 
 
-def no_context_text(tokenizer, target):
-    """``(context, decision_id, why)``: "Conclusion:" as the target spells it, and the
-    token condition 3 scores after it.
-
-    ``context`` is the target from the marker up to the decision token's first
-    character -- "Conclusion:" itself, whatever the target's spacing. It is checked
-    against the full target: tokenised on its own it must be exactly the tokens the
-    target has right before the decision token, so the probe asks for the same token
-    after the same tokens and differs from condition 3 only in what came before
-    them. ``why`` names the problem when it cannot be built, and is None otherwise.
-    """
-    ids, offsets = tokenise_target(tokenizer, target)
-    k, why = decision_index(target, offsets)
-    if why:
-        return None, None, why
-    context = target[target.index(MARKER):offsets[k][0]]
-    own = tokenizer(context, add_special_tokens=False).input_ids
-    if not own or ids[k - len(own):k] != own:
-        return None, None, (f"{context!r} tokenises on its own as {own}, but the target "
-                            f"has {ids[max(0, k - len(own)):k]} before its decision token")
-    return context, ids[k], None
-
-
 def no_context_target(tokenizer, target):
     """``(cut, decision_id, why)``: what --loss-on decision-no-context trains on.
 
@@ -709,14 +684,25 @@ def no_context_target(tokenizer, target):
     return cut, decision_id, None
 
 
+def _no_context(model, resampler, tokenizer, dev, dataset, indices, args, *, shuffled,
+                zero_latents):
+    """evaluate.no_context_records with the gate's settings: strict, so an example
+    whose decision token cannot be scored is fatal, as every other gate check is."""
+    return no_context_records(
+        model, resampler, tokenizer, dev, dataset, indices,
+        batch_size=args.batch_size, max_length=args.max_length,
+        task_stream=args.task_stream, seed=args.seed, shuffled=shuffled,
+        zero_latents=zero_latents, strict=True,
+        what=f"GATE: condition 4 {CONDITIONS[4]}")
+
+
 def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents):
     """Condition 4 under one condition, written to gate_no_context_<name>.jsonl.
 
-    :func:`no_context_records` on the gate's context; returns its records.
+    evaluate.no_context_records on the gate's context; returns its records.
     """
-    records = no_context_records(ctx.model, ctx.resampler, ctx.tokenizer, ctx.dev,
-                                 dataset, indices, args, shuffled=shuffled,
-                                 zero_latents=zero_latents)
+    records = _no_context(ctx.model, ctx.resampler, ctx.tokenizer, ctx.dev, dataset,
+                          indices, args, shuffled=shuffled, zero_latents=zero_latents)
     with open(os.path.join(args.ckpt_dir, f"gate_no_context_{name}.jsonl"), "w",
               encoding="utf-8") as f:
         for r in records:
@@ -728,7 +714,7 @@ def no_context_pass(ctx, dataset, indices, args, name, *, shuffled, zero_latents
 def eval_no_context_loss(model, resampler, tokenizer, dataset, indices, dev, args):
     """Condition 4 (a)'s quantity: eval-mode no-context loss, mean per label.
 
-    The --loss-on decision stop rule. The real condition of :func:`no_context_records`
+    The --loss-on decision stop rule. The real condition of evaluate.no_context_records
     -- the very function the gate's condition 4 pass calls -- over the same indices,
     reduced the way :func:`gate_verdict` reduces it, so the loop stops on the number
     the judged condition then re-measures. Returns :func:`mean_by_label`'s dict.
@@ -737,81 +723,10 @@ def eval_no_context_loss(model, resampler, tokenizer, dataset, indices, dev, arg
     """
     was_training = resampler.training
     resampler.eval()
-    records = no_context_records(model, resampler, tokenizer, dev, dataset, indices,
-                                 args, shuffled=False, zero_latents=False)
+    records = _no_context(model, resampler, tokenizer, dev, dataset, indices, args,
+                          shuffled=False, zero_latents=False)
     resampler.train(was_training)
     return mean_by_label([r["loss"] for r in records], [r["label"] for r in records])
-
-
-@torch.no_grad()
-def no_context_records(model, resampler, tokenizer, dev, dataset, indices, args, *,
-                       shuffled, zero_latents):
-    """Condition 4: the decision token after the prompt and "Conclusion:" alone.
-
-    Each example goes through training's own collate with its target REPLACED by
-    :func:`no_context_text`'s context, so the prompt, the template, strip_think, the
-    question stream and the -100 masking are training's, and the LLM reads the prompt
-    and then "Conclusion:" (and an EOS after it, which no earlier position can see).
-    The task stream is the run's, through task_stream_ids: under ``prompt`` the
-    "Conclusion:" tokens are target-side and the resampler does not read them, as in
-    training. The position read is the last context token, whose logits predict the
-    decision token: its cross-entropy is the loss, and p_yes is the logsumexp-pooled
-    Yes against No over the readout's own candidate ids, as evaluation computes it.
-
-    Fatal if any example's context cannot be built or the collate did not lay it out
-    as built. Returns the records, in ``indices`` order; writes nothing.
-    """
-    collate = make_collate_fn(tokenizer, max_length=args.max_length,
-                              strip_think=getattr(dataset, "base", dataset).config.strip_think)
-    # evaluation's readout: every single-token Yes / No spelling, pooled
-    yes_ids, no_ids = yes_no_token_ids(tokenizer)
-    cand = torch.tensor(yes_ids + no_ids, device=dev)
-    yes_pos = list(range(len(yes_ids)))
-    no_pos = list(range(len(yes_ids), len(yes_ids) + len(no_ids)))
-    donors = dataset.mapping if isinstance(dataset, ShuffledEmbeddings) else None
-    records, problems = [], []
-    for start in range(0, len(indices), args.batch_size):
-        items = [dataset[i] for i in indices[start:start + args.batch_size]]
-        built = [no_context_text(tokenizer, it["target"]) for it in items]
-        for it, (_, _, why) in zip(items, built):
-            if why:
-                problems.append(f"  {it['ecg_id']:>7} {it['superclass']:<6} {why}")
-        if problems:
-            continue
-        batch = collate([{**it, "target": context} for it, (context, _, _) in zip(items, built)])
-        task_ids, task_mask = task_stream_ids(batch, args.task_stream)
-        full_embeds, full_attn, Lq = splice_prefix(
-            model, resampler, batch["ecg_embed"].to(dev),
-            batch["input_ids"].to(dev), batch["attention_mask"].to(dev), dev,
-            zero_latents=zero_latents, task_ids=task_ids.to(dev),
-            task_mask=task_mask.to(dev))
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model(inputs_embeds=full_embeds, attention_mask=full_attn,
-                           use_cache=False).logits
-        for b, (it, (context, decision_id, _)) in enumerate(zip(items, built)):
-            span = (batch["labels"][b] != -100).nonzero().flatten()
-            n_ctx = len(tokenizer(context, add_special_tokens=False).input_ids)
-            if len(span) != n_ctx + 1:            # the context, then the EOS
-                problems.append(f"  {it['ecg_id']:>7} {it['superclass']:<6} the collate "
-                                f"laid out {len(span)} target tokens, not {n_ctx} + EOS")
-                continue
-            row = logits[b, Lq + int(span[n_ctx - 1])].float()
-            records.append({
-                "ecg_id": int(it["ecg_id"]), "superclass": it["superclass"],
-                "label": bool(it["label"]),
-                "loss": float(F.cross_entropy(row[None], torch.tensor([decision_id],
-                                                                      device=row.device))),
-                "p_yes": probability_from_logits(row[cand], yes_pos, no_pos),
-                "decision_token": tokenizer.decode([decision_id]),
-                "context": context,
-                "shuffled_embeddings": bool(shuffled), "zero_latents": bool(zero_latents),
-                "donor_ecg_id": donors[int(it["ecg_id"])] if donors else None,
-                "seed": args.seed,
-            })
-    if problems:
-        sys.exit(f"GATE: condition 4 {CONDITIONS[4]} cannot be evaluated for "
-                 f"{len(problems)} of {len(indices)} examples:\n" + "\n".join(problems))
-    return records
 
 
 def print_no_context_auprc(no_context_by_condition, labels):
