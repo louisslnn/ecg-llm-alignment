@@ -32,6 +32,10 @@ import train  # noqa: E402
 from src.data.dataset import Example  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
 
+# The two loss weights train.py requires on every command line; 0 and 0 is the LM
+# loss alone, which every test here is about.
+LM_ONLY = ("--lambda-linear", "0", "--lambda-consistency", "0")
+
 ABNORMAL = [sc for sc in SUPERCLASSES if sc != "NORM"]
 
 
@@ -133,14 +137,14 @@ def test_a_floor_that_cannot_be_met_is_an_error_not_a_smaller_floor():
 ])
 def test_the_command_line_refuses_what_stratified_cannot_mean(monkeypatch, capsys,
                                                             argv, message):
-    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *argv])
+    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *LM_ONLY, *argv])
     with pytest.raises(SystemExit):
         train.parse_args()
     assert message in capsys.readouterr().err
 
 
 def test_head_is_the_default_and_takes_any_n(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", "--overfit", "52"])
+    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *LM_ONLY, "--overfit", "52"])
     assert train.parse_args().overfit_select == "head"
 
 

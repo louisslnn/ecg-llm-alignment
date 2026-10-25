@@ -71,6 +71,16 @@ if the prefix is an order of magnitude shorter than the tokens, it draws almost 
 attention weight, and identical generations across conditions are explained by scale
 alone -- no amount of training signal in the latents will show up downstream.
 
+LINEAR HEAD. A checkpoint trained with --lambda-linear carries the head, and it is
+loaded with the resampler (a payload and meta that disagree on it are fatal). It reads
+the same prefix fast mode's student does (evaluate.linear_head_records), so it is
+scored on the fast-mode draw and on the generation draw, under each condition, and
+the run ends with one table per draw and condition: AUPRC for generation, fast mode
+and the head side by side, on the examples every one of them scored, with the mean
+|P(Yes) - P_linear(Yes)| of each readout against the head. The linear loss trains
+the head and the consistency loss is meant to pull the LLM toward it; this is where
+it shows whether it did. Per example to {tag}_{split}_linear_{draw}_{condition}.jsonl.
+
 Generation and teacher forcing default small -- 50 examples per generation
 condition at batch 1, 200 per teacher-forced condition -- because they are the
 diagnostic; fast mode is the evaluation, and covers the split.
@@ -107,9 +117,13 @@ from evaluate import (  # noqa: E402
     STRATIFY_MODES,
     EvalContext,
     apply_shuffle,
+    auprc,
     build_data_config,
+    checkpoint_objective,
     compute_all_metrics,
     compute_fast_metrics,
+    linear_head_records,
+    load_linear_head,
     load_split,
     no_context_records,
     print_fast_metrics,
@@ -542,6 +556,101 @@ def print_agreement(agreement):
           "the opposite of the model's own one-token answer.")
 
 
+def readout_comparison(readouts, n_draw=None):
+    """AUPRC of each readout on the examples EVERY readout scored, by group.
+
+    ``readouts`` is an ordered ``{name: (records, score_key)}``; the last entry is
+    the linear head, which every other readout's mean |P - P_linear| is taken
+    against. An example counts once every readout has a non-None score for its
+    (ecg_id, superclass) -- a generation with no readable conclusion has none -- so
+    the columns are on one set of examples and differ only in the readout. Groups
+    are "overall" and each superclass. Pure on the records.
+    """
+    names = list(readouts)
+    scores = {name: {(r["ecg_id"], r["superclass"]): r[key] for r in recs}
+              for name, (recs, key) in readouts.items()}
+    labels = {(r["ecg_id"], r["superclass"]): bool(r["label"])
+              for recs, _ in readouts.values() for r in recs}
+    first = readouts[names[0]][0]
+    shared = [(r["ecg_id"], r["superclass"]) for r in first
+              if all(scores[n].get((r["ecg_id"], r["superclass"])) is not None
+                     for n in names)]
+    linear = names[-1]
+    rows = {}
+    for group in ["overall", *SUPERCLASSES]:
+        keys = [k for k in shared if group == "overall" or k[1] == group]
+        y = np.array([labels[k] for k in keys], dtype=bool)
+        rows[group] = {"n": len(keys),
+                       "positive_rate": float(y.mean()) if keys else None,
+                       **{n: (auprc(y, np.array([scores[n][k] for k in keys]))
+                              if keys else None) for n in names}}
+    gaps = {n: (float(np.mean([abs(scores[n][k] - scores[linear][k]) for k in shared]))
+                if shared else None) for n in names[:-1]}
+    return {"readouts": names, "n": len(shared),
+            "n_draw": len(first) if n_draw is None else n_draw,
+            "rows": rows, "mean_abs_gap_to_linear": gaps}
+
+
+def print_readout_comparison(title, comparison):
+    names = comparison["readouts"]
+    header = (f"{'group':<9} {'n':>6} {'pos':>6}  "
+              + " ".join(f"{n:>11}" for n in names))
+    print(f"\n--- {title}: {comparison['n']} of {comparison['n_draw']} examples, "
+          "every readout scored ".ljust(len(header), "-"))
+    print(header)
+    for group, row in comparison["rows"].items():
+        print(f"{group:<9} {row['n']:>6} {_fmt(row['positive_rate'], width=6)}  "
+              + " ".join(_fmt(row[n], width=11) for n in names))
+    print("mean |P(Yes) - P_linear(Yes)|: " + "  ".join(
+        f"{n} {_fmt(v, width=0)}" for n, v in comparison["mean_abs_gap_to_linear"].items()))
+
+
+def run_linear(ctx, head, base, shuffled_view, indices, conditions, draw, args, paths):
+    """The linear head's P(Yes) on ``indices`` under each condition, written to
+    {tag}_{split}_linear_{draw}_{name}.jsonl; ``{name: records}``. The resampler
+    reads the stream fast mode gives it, prompt-and-target read as prompt."""
+    stream = "prompt" if args.task_stream == "prompt-and-target" else args.task_stream
+    out = {}
+    for name, opts in conditions:
+        path = os.path.join(args.out_dir, f"{args.tag}_{args.split}_linear_{draw}_{name}.jsonl")
+        paths[f"linear_{draw}_{name}"] = path
+        records = linear_head_records(
+            ctx.model, ctx.resampler, head, ctx.tokenizer, ctx.dev,
+            shuffled_view if opts["shuffled"] else base, indices,
+            batch_size=args.fast_batch_size, max_length=args.max_length,
+            task_stream=stream, seed=args.seed, **opts)
+        with open(path, "w", encoding="utf-8") as f:
+            for r in records:
+                r.update(split=args.split)
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"linear head, {draw} draw, {name}: {len(records):,} examples -> {path}",
+              flush=True)
+        out[name] = records
+    return out
+
+
+def fast_on(records_by_condition, indices, base, ctx, shuffled_view, conditions, args):
+    """Fast-mode records for exactly ``indices``, per condition: taken from the
+    fast pass when it covered every one of them (the whole split, by default),
+    otherwise scored here with the same function and settings."""
+    keys = [(base.examples[i].ecg_id, base.examples[i].superclass) for i in indices]
+    stream = "prompt" if args.task_stream == "prompt-and-target" else args.task_stream
+    out = {}
+    for name, opts in conditions:
+        have = {(r["ecg_id"], r["superclass"]): r
+                for r in records_by_condition.get(name, [])}
+        if all(k in have for k in keys):
+            out[name] = [have[k] for k in keys]
+            continue
+        out[name] = no_context_records(
+            ctx.model, ctx.resampler, ctx.tokenizer, ctx.dev,
+            shuffled_view if opts["shuffled"] else base, indices,
+            batch_size=args.fast_batch_size, max_length=args.max_length,
+            task_stream=stream, seed=args.seed, strict=False,
+            what=f"fast mode on the generation draw, {name}", **opts)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Run                                                                         #
 # --------------------------------------------------------------------------- #
@@ -657,6 +766,10 @@ def main():
     ctx = EvalContext.load(
         args.model_dir, args.ckpt, strip_think=data_cfg.strip_think,
         allow_strip_think_mismatch=args.allow_strip_think_mismatch)
+    objective, objective_recorded = checkpoint_objective(args.ckpt)
+    head = load_linear_head(args.ckpt, ctx.dev)
+    if head is None:
+        print("no linear head in this checkpoint: the linear-head readout is skipped")
 
     paths = {}
     # Fast mode first: it is the cheapest pass and the per-class numbers come from
@@ -665,6 +778,16 @@ def main():
     if not args.skip_fast:
         fast_by_condition, fast_metrics, fast_stream = run_fast(
             ctx, base, shuffled_view, fast_indices, args, paths)
+
+    # The head is a resampler forward and a dot product per example, no LLM: scored
+    # here, on both draws, so a decode that runs out of time leaves it written.
+    linear_fast, linear_gen = {}, {}
+    if head is not None:
+        if not args.skip_fast:
+            linear_fast = run_linear(ctx, head, base, shuffled_view, fast_indices,
+                                     CONDITIONS, "fast", args, paths)
+        linear_gen = run_linear(ctx, head, base, shuffled_view, gen_indices,
+                                gen_conditions, "generation", args, paths)
 
     tf_summaries = {}
     tf_comparison = None
@@ -734,6 +857,29 @@ def main():
                  for name, recs in by_condition.items() if name in fast_by_condition}
     print_agreement(agreement)
 
+    readouts = {}
+    if head is not None:
+        bar = "=" * 72
+        print(f"\n{bar}\nLINEAR HEAD vs FAST MODE vs GENERATION  (AUPRC, same examples; "
+              f"the head's checkpoint: lambda_linear {objective['lambda_linear']:g}, "
+              f"lambda_consistency {objective['lambda_consistency']:g})\n{bar}")
+        gen_fast = (fast_on(fast_by_condition, gen_indices, base, ctx, shuffled_view,
+                            gen_conditions, args) if not args.skip_fast else {})
+        for name, recs in by_condition.items():
+            sets = {"generation": (recs, "p_yes")}
+            if name in gen_fast:
+                sets["fast"] = (gen_fast[name], "p_yes")
+            sets["linear"] = (linear_gen[name], "p_linear")
+            readouts[f"generation draw, {name}"] = readout_comparison(sets)
+        for name, recs in fast_by_condition.items():
+            readouts[f"fast draw, {name}"] = readout_comparison(
+                {"fast": (recs, "p_yes"), "linear": (linear_fast[name], "p_linear")})
+        for title, comparison in readouts.items():
+            print_readout_comparison(title, comparison)
+        print("\nThe linear loss trains the head; the consistency loss pulls the LLM's "
+              "Yes/No toward it. Read the\ngap row: a gap that stays where it was "
+              "means generation was not dragged toward the head.")
+
     elapsed = time.time() - t_start
     summary_path = os.path.join(args.out_dir, f"{args.tag}_{args.split}_summary.json")
     with open(summary_path, "w") as f:
@@ -759,6 +905,8 @@ def main():
                       "batch_size": args.fast_batch_size, "metrics": fast_metrics}
                      if not args.skip_fast else None),
             "fast_vs_generation": agreement,
+            "objective": {**objective, "recorded": objective_recorded},
+            "linear_head": readouts if head is not None else None,
             "elapsed_seconds": round(elapsed, 1),
         }, f, indent=2)
     print(f"\ntotal {elapsed/60:.1f} min")

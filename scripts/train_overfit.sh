@@ -152,4 +152,6 @@ srun python scripts/train.py \
     --task-stream "$TASK_STREAM" \
     --batch-size 4 \
     --overfit-target-loss 0.05 \
-    --overfit-max-steps 3000
+    --overfit-max-steps 3000 \
+    --lambda-linear 0 \
+    --lambda-consistency 0

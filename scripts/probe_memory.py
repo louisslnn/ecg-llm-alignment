@@ -142,9 +142,13 @@ def check_gradients(model, resampler):
 
 
 def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
-                   loss_on: str = "all"):
+                   loss_on: str = "all", return_aux: bool = False):
     """The validated splice: prepend resampler latents to the token embeddings and
-    run the frozen LLM, loss on the target only. Returns ``out.loss``.
+    run the frozen LLM, loss on the target only. Returns ``out.loss``, or with
+    ``return_aux`` ``(out.loss, latents, out.logits, Lq)``: the resampler output
+    the linear head reads, and the logits the consistency loss reads, from this one
+    forward (train.py's --lambda-linear / --lambda-consistency). The logits are
+    over the spliced sequence, so input position t is logits row ``Lq + t``.
 
     Prompt + padding are already -100 in ``batch["labels"]``; the 64 latent
     positions are masked to -100 here too, so loss lands only on the target. Shared
@@ -230,6 +234,8 @@ def splice_forward(model, resampler, batch, dev, task_stream: str = "prompt",
             labels=full_labels,
             use_cache=False,
         )
+    if return_aux:
+        return out.loss, latents, out.logits, Lq
     return out.loss
 
 

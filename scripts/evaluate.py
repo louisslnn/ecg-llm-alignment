@@ -101,7 +101,7 @@ import sys
 import time
 from bisect import bisect_right
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -121,6 +121,7 @@ from src.data.dataset import (  # noqa: E402
     question_stream_tensors,
     task_stream_ids,
 )
+from src.model.linear_head import AuxiliaryLinearHead  # noqa: E402
 from src.model.resampler import PerceiverResamplerConfig, Resampler  # noqa: E402
 from src.teacher import parse as teacher_parse  # noqa: E402
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
@@ -839,6 +840,73 @@ def checkpoint_task_stream(ckpt_path: str) -> Optional[str]:
     return meta.get("task_stream") if isinstance(meta, dict) else None
 
 
+# train.py's objective before --lambda-llm / --lambda-linear / --lambda-consistency
+# existed: the LM loss alone, and no linear head.
+DEFAULT_OBJECTIVE = {"lambda_llm": 1.0, "lambda_linear": 0.0, "lambda_consistency": 0.0}
+
+
+def objective_of(meta) -> Tuple[Dict[str, float], bool]:
+    """``(lambdas, recorded)``: the loss weights a checkpoint's meta says it trained with.
+
+    train.py records all three next to task_stream and strip_think. A meta without
+    them predates the linear and consistency losses, and that run trained on the LM
+    loss alone: DEFAULT_OBJECTIVE, with ``recorded`` False so a caller can say the
+    value was inferred. Pure on the meta.
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    recorded = all(meta.get(k) is not None for k in DEFAULT_OBJECTIVE)
+    return ({k: float(meta[k]) if meta.get(k) is not None else v
+             for k, v in DEFAULT_OBJECTIVE.items()}, recorded)
+
+
+def _checkpoint_payload(path: str):
+    """A checkpoint read with mmap, so looking at its meta does not pull GBs off disk."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except (TypeError, RuntimeError, ValueError):    # older torch, or a legacy-format file
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def checkpoint_objective(ckpt_path: str) -> Tuple[Dict[str, float], bool]:
+    """:func:`objective_of` on a checkpoint file's meta, read with mmap."""
+    payload = _checkpoint_payload(resolve_ckpt_path(ckpt_path))
+    return objective_of(payload.get("meta") if isinstance(payload, dict) else None)
+
+
+def load_linear_head(ckpt_path: str, dev) -> Optional[AuxiliaryLinearHead]:
+    """The checkpoint's linear head, or None for a checkpoint trained without one.
+
+    The payload carries ``linear_head`` exactly when its meta says lambda_linear > 0,
+    which is when train.py builds one. A checkpoint where the two disagree is fatal:
+    either the weights or the record of what produced them is wrong, and an
+    evaluation of it would be read against the wrong config. Loaded strict, frozen,
+    in eval mode.
+    """
+    path = resolve_ckpt_path(ckpt_path)
+    payload = _checkpoint_payload(path)
+    lambdas, recorded = objective_of(payload.get("meta") if isinstance(payload, dict)
+                                     else None)
+    state = payload.get("linear_head") if isinstance(payload, dict) else None
+    print("checkpoint objective: " + "  ".join(f"{k} {v:g}" for k, v in lambdas.items())
+          + ("" if recorded else "  (NOT recorded: predates the linear and consistency "
+             "losses, so the LM loss alone)"), flush=True)
+    if (state is not None) != (lambdas["lambda_linear"] > 0):
+        sys.exit(f"linear head MISMATCH in {path}: its meta has lambda_linear "
+                 f"{lambdas['lambda_linear']:g}, but the payload "
+                 + ("carries a linear head" if state is not None else "has no linear "
+                    "head") + ". The weights and the record of the run that wrote them "
+                 "disagree; this checkpoint cannot be evaluated as either.")
+    if state is None:
+        return None
+    head = AuxiliaryLinearHead(state["classifier.weight"].shape[1])
+    head.load_state_dict(state, strict=True)
+    head = head.to(dev).eval()
+    for p in head.parameters():
+        p.requires_grad_(False)
+    print(f"linear head from {path}: hidden_dim {head.norm.normalized_shape[0]}")
+    return head
+
+
 def resolve_task_stream(ckpt_path: str, requested: Optional[str],
                         flag: str = "--task-stream") -> str:
     """The task stream an evaluation runs with, and where it came from, printed.
@@ -1027,7 +1095,8 @@ def prefix_scale_report(latents, tok_embeds, attn, label="prompt"):
 
 
 def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=False,
-                  report_label=None, task_ids=None, task_mask=None):
+                  report_label=None, task_ids=None, task_mask=None,
+                  return_latents=False):
     """Token embeddings with the resampler's latents spliced in front.
 
     The splice is the training splice (scripts/probe_memory.py splice_forward):
@@ -1047,6 +1116,10 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
     them for the run's --task-stream. None falls back to ``input_ids`` / ``attn``,
     every real token the LLM receives. The splice itself is unaffected: the LLM
     receives ``input_ids`` whatever the resampler read.
+
+    ``return_latents`` appends the prefix as the resampler produced it (zeroed under
+    ``zero_latents``), before the cast to the student's dtype: what the linear head
+    reads, as training hands it the latents.
     """
     if task_ids is None:
         task_ids = input_ids
@@ -1058,6 +1131,7 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
                             task_mask=task_mask.bool())
     if zero_latents:
         latents = torch.zeros_like(latents)
+    raw_latents = latents
     # torch.cat needs one dtype; autocast can hand back fp32 from a LayerNorm-final
     # path, and the student runs in bf16 regardless.
     latents = latents.to(tok_embeds.dtype)
@@ -1070,6 +1144,8 @@ def splice_prefix(model, resampler, ecg, input_ids, attn, dev, zero_latents=Fals
     full_attn = torch.cat(
         [torch.ones(B, Lq, dtype=attn.dtype, device=dev), attn], dim=1
     )
+    if return_latents:
+        return full_embeds, full_attn, Lq, raw_latents
     return full_embeds, full_attn, Lq
 
 
@@ -1761,6 +1837,51 @@ def no_context_records(model, resampler, tokenizer, dev, dataset, indices, *,
         print(f"{what}: {len(problems)} of {len(indices)} targets have no locatable "
               "decision token; those examples keep p_yes, with loss None:\n"
               + "\n".join(problems[:10]) + ("\n  ..." if len(problems) > 10 else ""))
+    return records
+
+
+@torch.no_grad()
+def linear_head_records(model, resampler, head, tokenizer, dev, dataset, indices, *,
+                        batch_size: int, max_length: int, task_stream: str, seed: int,
+                        shuffled: bool, zero_latents: bool):
+    """The linear head's P(Yes) per example, from the resampler's prefix alone.
+
+    The resampler is fed exactly as :func:`no_context_records` feeds it: training's
+    collate with the target replaced by MARKER, the task stream through
+    task_stream_ids, the latents from :func:`splice_prefix`. So on the same indices
+    and the same view of the split, this is the head's reading of the very prefix
+    fast mode's student reads. No LLM forward is needed for it, and none is run.
+    Under ``zero_latents`` the head reads the zeros that would be spliced, so that
+    column is one constant: the floor.
+
+    Returns the records in ``indices`` order; writes nothing.
+    """
+    collate = make_collate_fn(tokenizer, max_length=max_length,
+                              strip_think=base_of(dataset).config.strip_think)
+    donors = dataset.mapping if isinstance(dataset, ShuffledEmbeddings) else None
+    records = []
+    for start in range(0, len(indices), batch_size):
+        items = [dataset[i] for i in indices[start:start + batch_size]]
+        batch = collate([{**it, "target": MARKER} for it in items])
+        task_ids, task_mask = task_stream_ids(batch, task_stream)
+        *_, latents = splice_prefix(
+            model, resampler, batch["ecg_embed"].to(dev), batch["input_ids"].to(dev),
+            batch["attention_mask"].to(dev), dev, zero_latents=zero_latents,
+            task_ids=task_ids.to(dev), task_mask=task_mask.to(dev),
+            return_latents=True)
+        logits = head(latents)            # outside autocast, as in training: fp32
+        for it, logit in zip(items, logits.tolist()):
+            records.append({
+                "ecg_id": int(it["ecg_id"]), "superclass": it["superclass"],
+                "strat_fold": int(it["strat_fold"]),
+                "label": bool(it["label"]),
+                "linear_logit": float(logit),
+                "p_linear": float(torch.sigmoid(torch.tensor(logit))),
+                "shuffled_embeddings": bool(shuffled), "zero_latents": bool(zero_latents),
+                "donor_ecg_id": donors[int(it["ecg_id"])] if donors else None,
+                "task_stream": task_stream,
+                "seed": seed,
+            })
     return records
 
 

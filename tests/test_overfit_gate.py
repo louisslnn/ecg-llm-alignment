@@ -22,6 +22,10 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 from overfit_gate import gate_verdict  # noqa: E402
 
+# The two loss weights train.py requires on every command line; 0 and 0 is the LM
+# loss alone, which every test here is about.
+LM_ONLY = ("--lambda-linear", "0", "--lambda-consistency", "0")
+
 N = 50
 TARGET_LEN = 120
 
@@ -191,7 +195,7 @@ def test_the_stop_rule_measures_exactly_what_condition_1_measures():
 def _train_args(monkeypatch, *argv):
     import train
 
-    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *argv])
+    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *LM_ONLY, *argv])
     return train.parse_args()
 
 

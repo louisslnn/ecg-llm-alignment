@@ -4,21 +4,44 @@
 The student is frozen (bf16, sharded across the visible GPUs, use_cache=False); only
 the 843M resampler trains (fp32, AdamW). Each step reuses the exact splice validated
 in probe_memory.py: resampler latents are prepended to the token embeddings, prompt
-and padding are masked to -100, and the loss lands on the teacher target only. There
-is no linear head -- the target's Reasoning already carries the Yes/No, so a
-conclusion-logit AUPRC would be meaningless; validation reports mean loss only.
+and padding are masked to -100, and the loss lands on the teacher target only.
 
-Checkpoints (resampler + optimizer + step/epoch/best) go to --ckpt-dir (scratch),
-every --ckpt-every steps and at each epoch end. On startup it resumes automatically
-from the latest checkpoint if one exists. Only the last 2 rotating checkpoints plus
-best.pt (lowest val loss) are kept.
+Two more terms come from ChatHealthAI's ICU workflow, and the objective is
+
+    lambda_llm * llm  +  lambda_linear * linear  +  lambda_consistency * consistency
+
+  linear       a one-logit head on the resampler output (src/model/linear_head.py),
+               BCE-with-logits against the gold label, positives weighted by n_neg/n_pos
+               of that example's superclass in the train split. Its own AdamW group,
+               --linear-head-lr. It trains the resampler too: the latents are not
+               detached on the way in.
+  consistency  the LLM's teacher-forced Yes-vs-No logit at the position before the
+               gold Yes/No token, pulled toward sigmoid(linear logit).detach(). The
+               target is detached, so this reaches the resampler through the frozen
+               LLM and never the head, which is asserted every step.
+
+--lambda-linear and --lambda-consistency are required, so every run states them; 0 and
+0 is the LM loss alone, as every run before them. Each term is logged unweighted and
+weighted, with the mean |P_llm(Yes) - P_linear(Yes)| over the batch. best.pt is still
+chosen on the validation LLM loss.
+
+Checkpoints (resampler + head + optimizer + step/epoch/best) go to --ckpt-dir
+(scratch), every --ckpt-every steps and at each epoch end. On startup it resumes
+automatically from the latest checkpoint if one exists. Only the last 2 rotating
+checkpoints plus best.pt (lowest val LLM loss) are kept; --save-every-epoch also keeps
+a weights-only epochNN.pt (~3.4 GB) per epoch.
+
+    # full run with the linear and consistency losses, every epoch kept
+    python scripts/train.py --model-dir $MODEL_DIR --ckpt-dir $SCRATCH/ecg/ckpt \
+        --lambda-linear 1.0 --lambda-consistency 0.5 --save-every-epoch
 
     # the gate: overfit 50 examples, then show it three ways on those same 50 --
     # teacher-forced loss, free generation, and the loss at the Yes/No token for
     # each label separately (scripts/overfit_gate.py). Exits 0 only if all three pass.
     # Pass or fail, the resampler the gate judged is left in --ckpt-dir as
     # overfit_final.pt (~3.4 GB), so it can be probed without retraining it.
-    python scripts/train.py --model-dir $MODEL_DIR --overfit 50
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 \
+        --lambda-linear 0 --lambda-consistency 0
 
     # the same gate with the loss on ONE position per example, the Yes/No token
     # after "Conclusion:" (--loss-on decision; the default, all, is the whole
@@ -35,7 +58,8 @@ best.pt (lowest val loss) are kept.
     # (--no-skip-generation to run it). Give it its own --ckpt-dir: it writes the
     # same file names as any other gate run.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --loss-on decision \
-        --overfit-select stratified
+        --overfit-select stratified \
+        --lambda-linear 0 --lambda-consistency 0
 
     # the same, with the Yes/No token trained the way condition 4 asks for it: each
     # target cut to "Conclusion:" and that token, no Evidence and no Reasoning
@@ -43,16 +67,19 @@ best.pt (lowest val loss) are kept.
     # the training loss, the stop rule and condition 4 are then one quantity. Under
     # --loss-on decision the full target sits in context and supplies the answer.
     python scripts/train.py --model-dir $MODEL_DIR --overfit 50 \
-        --loss-on decision-no-context --overfit-select stratified
+        --loss-on decision-no-context --overfit-select stratified \
+        --lambda-linear 0 --lambda-consistency 0
 
     # the same gate on records drawn so that every superclass has at least three
     # Yes and three No among them (--overfit-select stratified; the default, head,
     # is the first N train examples). On the head set the answer can be read off
     # the question alone; see stratified_records for the rule that draws these.
-    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --overfit-select stratified
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 --overfit-select stratified \
+        --lambda-linear 0 --lambda-consistency 0
 
-    # full run (auto-resumes)
-    python scripts/train.py --model-dir $MODEL_DIR --ckpt-dir $SCRATCH/ecg/ckpt
+    # full run (auto-resumes), LM loss alone
+    python scripts/train.py --model-dir $MODEL_DIR --ckpt-dir $SCRATCH/ecg/ckpt \
+        --lambda-linear 0 --lambda-consistency 0
 
 Compute nodes have no internet, so the checkpoint + tokenizer load from --model-dir
 with local_files_only=True (pre-downloaded by scripts/setup_narval.sh).
@@ -70,6 +97,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, REPO_ROOT)
@@ -82,13 +110,20 @@ from src.data.dataset import (  # noqa: E402
     make_collate_fn,
     task_stream_ids,
 )
+from src.model.linear_head import AuxiliaryLinearHead  # noqa: E402
 from src.model.resampler import (  # noqa: E402
     PerceiverResamplerConfig,
     Resampler,
     mean_embedding_norm,
 )
 from src.teacher.prompt import SUPERCLASSES  # noqa: E402
-from evaluate import checkpoint_task_stream, require_strip_think_match  # noqa: E402
+from evaluate import (  # noqa: E402
+    checkpoint_objective,
+    checkpoint_task_stream,
+    objective_of,
+    require_strip_think_match,
+    yes_no_token_ids,
+)
 from overfit_gate import (  # noqa: E402
     DECISION_MODES,
     GATE_DECISION_LOSS,
@@ -116,6 +151,10 @@ OVERFIT_SELECT_MODES = ("head", "stratified")
 # --overfit-select stratified: every superclass has at least this many Yes and this
 # many No among the chosen records. The gate's definition, changed here, not per run.
 STRATIFIED_MIN_PER_ANSWER = 3
+DEFAULT_LINEAR_HEAD_LR = 1e-4
+# What a preempted run exits with after its emergency checkpoint. Anything but 0:
+# Slurm reads 0 as COMPLETED, and a COMPLETED job is never requeued.
+PREEMPT_EXIT_CODE = 75                    # EX_TEMPFAIL
 
 
 def parse_args():
@@ -185,6 +224,25 @@ def parse_args():
                          "prompt. ON by default; --no-strip-think keeps the block, as "
                          "runs 1 and 2 trained. Evaluation must be given the same "
                          "setting or the student is scored on a prompt it never saw")
+    # the linear and consistency losses (ChatHealthAI's ICU workflow)
+    ap.add_argument("--lambda-llm", type=float, default=1.0,
+                    help="weight on the LM loss, the --loss-on quantity (default 1.0)")
+    ap.add_argument("--lambda-linear", type=float, required=True,
+                    help="weight on the linear head's BCE against the gold label, "
+                         "positives weighted per superclass by n_neg/n_pos in the train "
+                         "split. REQUIRED, so a run always states it; 0 builds no head")
+    ap.add_argument("--lambda-consistency", type=float, required=True,
+                    help="weight on the BCE pulling the LLM's teacher-forced Yes-vs-No "
+                         "logit, at the position before the gold Yes/No token, toward "
+                         "sigmoid(linear logit).detach(). REQUIRED; > 0 needs "
+                         "--lambda-linear > 0, since the target comes from the head")
+    ap.add_argument("--linear-head-lr", type=float, default=None,
+                    help=f"the head's own AdamW learning rate (default "
+                         f"{DEFAULT_LINEAR_HEAD_LR:g}; the resampler's is --lr)")
+    ap.add_argument("--save-every-epoch", action="store_true",
+                    help="also write a weights-only epochNN.pt (resampler + head, no "
+                         "optimizer, ~3.4 GB) at each epoch end, never rotated, so the "
+                         "run can be evaluated at every epoch and not only the last two")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--grad-checkpointing", choices=["on", "off"], default="off",
                     help="LLM activation checkpointing; off by default -- the probe "
@@ -265,6 +323,33 @@ def parse_args():
                  "same quantity the gate's first condition checks")
     if args.overfit_eval_every < 1:
         ap.error("--overfit-eval-every must be at least 1")
+    lambdas = {"--lambda-llm": args.lambda_llm, "--lambda-linear": args.lambda_linear,
+               "--lambda-consistency": args.lambda_consistency}
+    negative = [f"{k} {v:g}" for k, v in lambdas.items() if v < 0]
+    if negative:
+        ap.error(f"loss weights cannot be negative: {', '.join(negative)}")
+    if not any(lambdas.values()):
+        ap.error("all three loss weights are 0: nothing would train")
+    # The consistency target is sigmoid of the head's logit. With no linear loss the
+    # head never trains, and the LLM would be pulled toward its initialisation.
+    if args.lambda_consistency > 0 and args.lambda_linear == 0:
+        ap.error(f"--lambda-consistency {args.lambda_consistency:g} needs "
+                 "--lambda-linear > 0: the consistency target comes from the linear "
+                 "head, which nothing would train")
+    if args.linear_head_lr is not None and args.lambda_linear == 0:
+        ap.error("--linear-head-lr sets the linear head's learning rate; with "
+                 "--lambda-linear 0 there is no head and it would be silently ignored")
+    if args.linear_head_lr is None:
+        args.linear_head_lr = DEFAULT_LINEAR_HEAD_LR
+    if args.overfit is not None:
+        # The gate's stop rule and verdict are about the LM loss alone.
+        if args.lambda_linear or args.lambda_consistency or args.lambda_llm != 1.0:
+            ap.error("--overfit trains and judges the LM loss alone: pass "
+                     "--lambda-llm 1 --lambda-linear 0 --lambda-consistency 0 (got "
+                     + ", ".join(f"{k} {v:g}" for k, v in lambdas.items()) + ")")
+        if args.save_every_epoch:
+            ap.error("--save-every-epoch writes a checkpoint per epoch of a full run; "
+                     "--overfit has no epochs to keep and would silently ignore it")
     # On the head set all ten records are normal: every question has one answer
     # across the set, so condition 4's shuffled column and donor rows cannot show
     # anything, and its verdict would be meaningless rather than merely weak.
@@ -306,8 +391,8 @@ def set_seed(seed):
 
 
 # Set by the SIGUSR1/SIGTERM handler (train.sh's `--signal=USR1@120` fires ~120 s
-# before the time limit / on preemption). The training loop checkpoints and exits at
-# the next step boundary, so --requeue restarts from a fresh checkpoint.
+# before the time limit / on preemption). The training loop checkpoints at the next
+# step boundary and calls requeue_and_exit, which restarts it from that checkpoint.
 _PREEMPT = {"flag": False}
 
 # Settings written into every checkpoint, filled in by main(). A prefix-scale sweep
@@ -360,6 +445,32 @@ def _install_signal_handlers():
     signal.signal(signal.SIGTERM, handler)
 
 
+def requeue_and_exit():
+    """After the emergency checkpoint: put the job back in the queue, exit non-zero.
+
+    Exiting 0 here is what lost a run: Slurm records exit 0 as COMPLETED, --requeue
+    never fires for a COMPLETED job, and the time-limit signal is not a preemption in
+    any case. So the job requeues itself with ``scontrol requeue``, and exits
+    PREEMPT_EXIT_CODE whatever happened, so a requeue that failed shows as FAILED in
+    sacct rather than as a run that finished. Outside Slurm there is nothing to
+    requeue; the exit code alone says the run stopped early.
+    """
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        try:
+            r = subprocess.run(["scontrol", "requeue", job], capture_output=True,
+                               text=True, timeout=60)
+            ok, said = r.returncode == 0, (r.stderr or r.stdout).strip()
+        except (OSError, subprocess.SubprocessError) as err:
+            ok, said = False, str(err)
+        print(f"scontrol requeue {job}: " + ("requeued" if ok else
+              f"FAILED ({said}); resubmit by hand, the checkpoint is written"),
+              flush=True)
+    else:
+        print("no SLURM_JOB_ID: not under Slurm, nothing to requeue", flush=True)
+    sys.exit(PREEMPT_EXIT_CODE)
+
+
 def preflight(args, data_cfg):
     """Check every input path exists BEFORE loading the 14B model (slow)."""
     checks = [
@@ -391,9 +502,11 @@ def _rotating(ckpt_dir):
                   key=lambda p: int(_STEP_RE.search(p).group(1)))
 
 
-def _payload(resampler, epoch, step, best_val, meta=None):
-    """What every checkpoint carries; evaluate.py reads these keys."""
-    return {
+def _payload(resampler, epoch, step, best_val, meta=None, head=None):
+    """What every checkpoint carries; evaluate.py reads these keys. ``linear_head``
+    is there exactly when the run has a head (its meta's lambda_linear > 0), which
+    evaluate.load_linear_head holds a checkpoint to."""
+    payload = {
         "resampler": resampler.state_dict(),
         "epoch": epoch,
         "global_step": step,
@@ -408,11 +521,14 @@ def _payload(resampler, epoch, step, best_val, meta=None):
             "python": random.getstate(),
         },
     }
+    if head is not None:
+        payload["linear_head"] = head.state_dict()
+    return payload
 
 
 def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_best,
-                    meta=None):
-    payload = _payload(resampler, epoch, step, best_val, meta)
+                    meta=None, head=None):
+    payload = _payload(resampler, epoch, step, best_val, meta, head)
     payload["optimizer"] = optimizer.state_dict()
     path = os.path.join(ckpt_dir, f"ckpt_step{step}.pt")
     torch.save(payload, path + ".tmp")
@@ -424,6 +540,21 @@ def save_checkpoint(ckpt_dir, resampler, optimizer, epoch, step, best_val, is_be
     # keep only the last 2 rotating checkpoints (best.pt is separate, never pruned)
     for old in _rotating(ckpt_dir)[:-2]:
         os.remove(old)
+    return path
+
+
+def save_epoch_checkpoint(ckpt_dir, resampler, epoch, step, best_val, head=None):
+    """--save-every-epoch: ``ckpt_dir/epochNN.pt`` after ``epoch`` epochs, never pruned.
+
+    Weights and meta only, no optimizer state, ~3.4 GB: enough to evaluate the run at
+    that epoch, not to resume it (resume() only looks at ckpt_step*.pt). The rotation
+    keeps two checkpoints, so without these the epoch at which the head and the LLM
+    agree best cannot be found after the fact.
+    """
+    payload = _payload(resampler, epoch, step, best_val, head=head)
+    path = os.path.join(ckpt_dir, f"epoch{epoch:02d}.pt")
+    torch.save(payload, path + ".tmp")
+    os.replace(path + ".tmp", path)          # atomic
     return path
 
 
@@ -473,7 +604,33 @@ def require_task_stream_match(path, task_stream):
              f"--task-stream {trained}, or a fresh --ckpt-dir.")
 
 
-def resume(ckpt_dir, resampler, optimizer, dev, loss_on="all"):
+def objective_lambdas(args):
+    """This run's three loss weights, keyed as the checkpoint meta records them."""
+    return {"lambda_llm": float(args.lambda_llm),
+            "lambda_linear": float(args.lambda_linear),
+            "lambda_consistency": float(args.lambda_consistency)}
+
+
+def require_objective_match(path, trained, recorded, lambdas):
+    """Refuse to resume a checkpoint under loss weights it did not train with.
+
+    ``(trained, recorded)`` is evaluate.objective_of on the checkpoint's meta, so a
+    checkpoint from before the flags is the LM loss alone (1, 0, 0). A change of
+    weights is a different objective -- and a different optimizer, when the head
+    comes or goes -- so there is no way through, as for --loss-on.
+    """
+    if trained == lambdas:
+        return
+    flags = "  ".join(f"--{k.replace('_', '-')} {v:g}" for k, v in trained.items())
+    sys.exit(f"objective MISMATCH: {path} was trained with {flags} ("
+             + ("recorded in its meta" if recorded else "NOT recorded: it predates the "
+                "flags, so the LM loss alone") + "), this run has "
+             + "  ".join(f"--{k.replace('_', '-')} {v:g}" for k, v in lambdas.items())
+             + f". Pass {flags}, or a fresh --ckpt-dir.")
+
+
+def resume(ckpt_dir, resampler, optimizer, dev, loss_on="all", head=None,
+           lambdas=None):
     ckpts = _rotating(ckpt_dir)
     if not ckpts:
         print("no checkpoint found; starting fresh")
@@ -490,7 +647,11 @@ def resume(ckpt_dir, resampler, optimizer, dev, loss_on="all"):
                  "objective under another, against a best_val_loss that is a "
                  f"different quantity. Pass --loss-on {trained_on}, or a fresh "
                  "--ckpt-dir.")
+    if lambdas is not None:
+        require_objective_match(path, *objective_of(payload.get("meta")), lambdas)
     resampler.load_state_dict(payload["resampler"])
+    if head is not None:
+        head.load_state_dict(payload["linear_head"])
     optimizer.load_state_dict(payload["optimizer"])
     rng = payload.get("rng")
     if rng:
@@ -603,6 +764,166 @@ def make_no_context_collate(tokenizer, collate):
     return no_context_collate
 
 
+class ConsistencyTargetError(RuntimeError):
+    """A target the consistency loss cannot read its gold Yes/No position from."""
+
+
+_SWAP = {"yes": "no", "no": "yes"}
+
+
+def _swapped_word(word):
+    """The other answer, spelled in ``word``'s case: Yes -> No, no -> yes, YES -> NO."""
+    other = _SWAP[word.lower()]
+    if word.isupper() and len(word) > 1:
+        return other.upper()
+    return other.capitalize() if word[0].isupper() else other
+
+
+def consistency_position(tokenizer, target, label, yes_ids, no_ids):
+    """``(k, ids, why)``: the gold Yes/No token's index in the target's tokens.
+
+    The consistency loss reads the LLM's logits at the row before it. ``ids`` are the
+    target's tokens as tokenise_target builds them (the collate's, EOS included).
+    The position comes from decision_token's locator -- the one every other script
+    uses -- and the reference's guards, every one fatal for the caller:
+
+      * exactly one "Conclusion:" in the target (decision_index);
+      * the token after it is a single Yes/No token: one of yes_ids / no_ids
+        (evaluate.yes_no_token_ids, the readout's own sets), nothing glued to it;
+      * that word agrees with the gold label;
+      * the counterfactual: the same target with Yes and No swapped, re-tokenised,
+        has its answer at the same index, behind the same tokens, as the other
+        word's token. So where the logit is read cannot depend on the answer.
+
+    ``why`` names the first guard that fails, None when all hold. Pure on the
+    tokenizer and the text; the collate checks the layout on top of this.
+    """
+    ids, offsets = tokenise_target(tokenizer, target)
+    k, why = decision_index(target, offsets)
+    if why:
+        return None, ids, why
+    word = tokenizer.decode([ids[k]]).strip()
+    if word.lower() not in _SWAP or ids[k] not in (*yes_ids, *no_ids):
+        return None, ids, (f"the token after {MARKER!r} is "
+                           f"{tokenizer.decode([ids[k]])!r}, not a single Yes/No token")
+    if (ids[k] in yes_ids) != bool(label):
+        return None, ids, (f"the target concludes {word!r} but the gold label is "
+                           f"{bool(label)}")
+    s, e = offsets[k]
+    other = _swapped_word(word)
+    swapped = target[:s] + target[s:e].replace(word, other, 1) + target[e:]
+    ids2, offsets2 = tokenise_target(tokenizer, swapped)
+    k2, why2 = decision_index(swapped, offsets2)
+    if (why2 or k2 != k or ids2[:k] != ids[:k]
+            or ids2[k] not in (no_ids if label else yes_ids)):
+        return None, ids, (f"swapping {word!r} for {other!r} moves the answer: token "
+                           f"{k} becomes " + (why2 if why2 else
+                           f"{k2}, {tokenizer.decode([ids2[k2]])!r}"))
+    return k, ids, None
+
+
+def make_consistency_collate(tokenizer, collate, yes_ids, no_ids):
+    """``collate``, plus ``consistency_pos``: where the consistency loss reads the LLM.
+
+    One long per row: the index in ``input_ids`` of the gold Yes/No token, from
+    :func:`consistency_position` on the row's own target, checked against what the
+    collate laid out -- the target's tokens must be the supervised span's, token
+    for token as far as the span runs, so the gold token is supervised (its label
+    is the token, not -100). The logits row before it is the one the loss reads.
+
+    -1 where --max-length cut the target before the gold token: that row has no
+    conclusion to read, so it sits out the consistency loss and keeps the LLM and
+    linear ones, and the training loop counts it. Any other failure raises
+    ConsistencyTargetError naming every failing example in the batch. Every tensor
+    ``collate`` built is left as it was.
+
+    Under --loss-on decision or decision-no-context this goes INSIDE their collate,
+    so it sees the targets they hand the base collate (cut, for no-context).
+    """
+    yes_ids, no_ids = list(yes_ids), list(no_ids)
+
+    def consistency_collate(batch):
+        out = collate(batch)
+        labels = out["labels"]
+        pos = torch.full((len(batch),), -1, dtype=torch.long)
+        problems = []
+        for i, b in enumerate(batch):
+            k, ids, why = consistency_position(tokenizer, b["target"], b["label"],
+                                               yes_ids, no_ids)
+            if why is None:
+                span = (labels[i] != -100).nonzero().flatten()
+                if labels[i][span].tolist() != ids[:len(span)]:
+                    why = (f"the supervised span ({len(span)} tokens) is not the "
+                           f"target's tokens ({len(ids)})")
+                elif k < len(span):
+                    pos[i] = span[k]
+            if why:
+                problems.append(f"  {b['ecg_id']:>7} {b['superclass']:<6} {why}")
+        if problems:
+            raise ConsistencyTargetError(
+                f"the consistency loss cannot read the gold Yes/No position for "
+                f"{len(problems)} of the {len(batch)} examples in a batch:\n"
+                + "\n".join(problems))
+        out["consistency_pos"] = pos
+        return out
+
+    return consistency_collate
+
+
+def check_consistency_targets(tokenizer, splits, yes_ids, no_ids):
+    """Every target of ``splits`` (name -> dataset) through consistency_position, now.
+
+    The collate would raise on the same targets, but hours into an epoch; this says
+    all of them at once, before the student loads. Truncation by --max-length is
+    not checked here: that depends on the prompt, is not an error, and is counted
+    as training meets it.
+    """
+    t0 = time.time()
+    problems, n = [], 0
+    for name, dataset in splits.items():
+        for e in dataset.examples:
+            n += 1
+            _, _, why = consistency_position(tokenizer, e.target, e.label,
+                                             yes_ids, no_ids)
+            if why:
+                problems.append(f"  {name:<5} {e.ecg_id:>7} {e.superclass:<6} {why}")
+    if problems:
+        raise ConsistencyTargetError(
+            f"{len(problems)} of {n} targets fail the consistency loss's guards:\n"
+            + "\n".join(problems[:50])
+            + (f"\n  ... and {len(problems) - 50} more" if len(problems) > 50 else ""))
+    print(f"consistency guards: all {n} targets of {', '.join(splits)} pass "
+          f"({time.time() - t0:.0f}s)", flush=True)
+
+
+def superclass_pos_weights(examples):
+    """superclass -> n_neg / n_pos over ``examples``: the linear loss's pos_weight.
+
+    One weight per superclass rather than the reference's one global n_neg/n_pos:
+    the positive rate runs from 0.415 for NORM to 0.119 for HYP, and the head is
+    trained on all five questions at once. Raises ValueError for a superclass with
+    no positive, whose weight would be infinite.
+    """
+    out = {}
+    for sc, n in label_counts(examples).items():
+        if n["yes"] == 0:
+            raise ValueError(f"{sc} has no positive example ({n['no']} negatives): "
+                             "its pos_weight n_neg/n_pos is undefined")
+        out[sc] = n["no"] / n["yes"]
+    return out
+
+
+def print_pos_weights(examples, weights):
+    counts = label_counts(examples)
+    print(f"linear loss pos_weight per superclass (train split): "
+          f"{'superclass':<10} {'Yes':>6} {'No':>6} {'rate':>6} {'pos_weight':>10}")
+    for sc, w in weights.items():
+        n = counts[sc]
+        print(f"{'':<54}{sc:<10} {n['yes']:>6} {n['no']:>6} "
+              f"{n['yes'] / (n['yes'] + n['no']):>6.3f} {w:>10.3f}")
+    sys.stdout.flush()
+
+
 def label_counts(examples):
     """superclass -> {"yes": n, "no": n} over ``examples``, in SUPERCLASSES order."""
     counts = {sc: {"yes": 0, "no": 0} for sc in SUPERCLASSES}
@@ -713,12 +1034,24 @@ def print_overfit_selection(selection, n_examples, seed):
     sys.stdout.flush()
 
 
-def build_loaders(args, tokenizer, data_cfg):
+def build_loaders(args, tokenizer, data_cfg, yes_no=None):
+    """``(train_loader, val_loader, pos_weight)``. ``yes_no`` is ``(yes_ids, no_ids)``
+    when the run has a linear head: the batches then carry consistency_pos, every
+    target is checked against the consistency guards first, and ``pos_weight`` is
+    :func:`superclass_pos_weights` over the train split (None without a head)."""
     from torch.utils.data import DataLoader, Subset
 
     splits = build_datasets(data_cfg)
     collate = make_collate_fn(tokenizer, max_length=args.max_length,
                               strip_think=data_cfg.strip_think)
+    pos_weight = None
+    if yes_no is not None:
+        check_consistency_targets(tokenizer, {k: splits[k] for k in ("train", "val")},
+                                  *yes_no)
+        pos_weight = superclass_pos_weights(splits["train"].examples)
+        print_pos_weights(splits["train"].examples, pos_weight)
+        _RUN_META["linear_pos_weight"] = pos_weight
+        collate = make_consistency_collate(tokenizer, collate, *yes_no)
     if args.loss_on == "decision":
         collate = make_decision_collate(tokenizer, collate)
     elif args.loss_on == "decision-no-context":
@@ -740,7 +1073,7 @@ def build_loaders(args, tokenizer, data_cfg):
         train_loader = DataLoader(train, batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.num_workers, collate_fn=collate,
                                   generator=g, drop_last=False)
-        return train_loader, None
+        return train_loader, None, pos_weight
 
     train_loader = DataLoader(splits["train"], batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, collate_fn=collate,
@@ -748,24 +1081,162 @@ def build_loaders(args, tokenizer, data_cfg):
     val_loader = DataLoader(splits["val"], batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=collate)
     print(f"train {len(splits['train']):,} examples  val {len(splits['val']):,} examples")
-    return train_loader, val_loader
+    return train_loader, val_loader, pos_weight
 
 
 # --------------------------------------------------------------------------- #
 # Train / validate                                                            #
 # --------------------------------------------------------------------------- #
 
+def llm_binary_logits(logits, rows, positions, yes_ids, no_ids):
+    """The LLM's log-odds of Yes at ``logits[rows, positions]``: logsumexp over the
+    Yes ids minus logsumexp over the No ids. Its sigmoid is exactly
+    evaluate.probability_from_logits, the P(Yes) every readout reports."""
+    picked = logits[rows, positions].float()                  # (n, vocab)
+    return (torch.logsumexp(picked[:, list(yes_ids)], dim=-1)
+            - torch.logsumexp(picked[:, list(no_ids)], dim=-1))
+
+
+def consistency_loss(llm_binary_logit, linear_logits):
+    """BCE-with-logits of the LLM's Yes log-odds against sigmoid(linear logit),
+    DETACHED: the head is the target, so nothing here may move it."""
+    return F.binary_cross_entropy_with_logits(
+        llm_binary_logit, torch.sigmoid(linear_logits).detach())
+
+
+def assert_consistency_spares_head(consistency, head):
+    """The reference's guard: d(consistency)/d(head) must be None for every head
+    parameter. Raises GradFlowError naming the ones it reaches. Walks no node: the
+    autograd engine only runs what leads to the inputs asked for, and none should."""
+    params = list(head.named_parameters())
+    grads = torch.autograd.grad(consistency, [p for _, p in params],
+                                retain_graph=True, allow_unused=True)
+    leaked = [name for (name, _), g in zip(params, grads) if g is not None]
+    if leaked:
+        raise GradFlowError(f"the consistency loss reaches the linear head's "
+                            f"{leaked}: its target is not detached")
+
+
+def check_head_gradients(head):
+    """One-time, beside check_gradients: the linear loss reached every head parameter."""
+    for name, p in head.named_parameters():
+        if p.grad is None or not bool(torch.isfinite(p.grad).all()):
+            raise GradFlowError(f"linear head {name}: grad is "
+                                + ("None" if p.grad is None else "non-finite"))
+
+
+def make_objective(args, head=None, yes_ids=None, no_ids=None, pos_weight=None):
+    """``objective(model, resampler, batch, dev) -> (total, terms)``.
+
+    ``total`` is what backward() is called on: lambda_llm * llm + lambda_linear *
+    linear + lambda_consistency * consistency. ``terms`` holds each term unweighted
+    as a float, for the log, with the mean |P_llm(Yes) - P_linear(Yes)| (``gap``)
+    and how many rows the consistency term was over and sat out.
+
+    Without a head it is the splice's loss times lambda_llm and nothing else, so a
+    run with --lambda-linear 0 --lambda-consistency 0 takes the step it always took.
+
+    llm is the --loss-on quantity, unchanged. linear is the head's BCE-with-logits
+    on the resampler's own latents (not detached: it trains the resampler too) with
+    the example's superclass pos_weight. consistency is read off the SAME forward's
+    logits at the row before each gold Yes/No token (batch["consistency_pos"]), over
+    the rows that have one; with none in the batch it is absent from the sum and
+    the log. Whenever it is in the sum, assert_consistency_spares_head runs.
+    """
+    if head is not None and pos_weight is None:
+        raise ValueError("a linear head needs the per-superclass pos_weight")
+
+    def objective(model, resampler, batch, dev):
+        if head is None:
+            llm = splice_forward(model, resampler, batch, dev,
+                                 task_stream=args.task_stream, loss_on=args.loss_on)
+            return args.lambda_llm * llm, {"llm": float(llm.detach())}
+        llm, latents, logits, Lq = splice_forward(
+            model, resampler, batch, dev, task_stream=args.task_stream,
+            loss_on=args.loss_on, return_aux=True)
+        linear_logits = head(latents)            # outside autocast: fp32
+        weights = torch.tensor([pos_weight[sc] for sc in batch["superclass"]],
+                               dtype=torch.float32, device=linear_logits.device)
+        linear = F.binary_cross_entropy_with_logits(
+            linear_logits, batch["head_label"].to(linear_logits.device),
+            pos_weight=weights)
+        total = args.lambda_llm * llm + args.lambda_linear * linear
+        pos = batch["consistency_pos"]
+        rows = (pos >= 0).nonzero().flatten()
+        terms = {"llm": float(llm.detach()), "linear": float(linear.detach()),
+                 "consistency": None, "gap": None, "n_consistency": len(rows),
+                 "n_skipped": len(pos) - len(rows)}
+        if len(rows):
+            llm_logit = llm_binary_logits(
+                logits, rows.to(logits.device), (Lq + pos[rows] - 1).to(logits.device),
+                yes_ids, no_ids).to(linear_logits.device)
+            head_logit = linear_logits[rows.to(linear_logits.device)]
+            consistency = consistency_loss(llm_logit, head_logit)
+            if args.lambda_consistency > 0:
+                if consistency.requires_grad:
+                    assert_consistency_spares_head(consistency, head)
+                total = total + args.lambda_consistency * consistency
+            terms["consistency"] = float(consistency.detach())
+            terms["gap"] = float((torch.sigmoid(llm_logit)
+                                  - torch.sigmoid(head_logit)).abs().mean().detach())
+        return total, terms
+
+    return objective
+
+
+def mean_terms(window):
+    """The terms of a window of batches, reduced: llm and linear are means over the
+    batches, consistency and gap means over the rows they were taken on."""
+    out = {"llm": sum(t["llm"] for t in window) / max(len(window), 1)}
+    if window and "linear" in window[0]:
+        out["linear"] = sum(t["linear"] for t in window) / len(window)
+        n = sum(t["n_consistency"] for t in window)
+        out["n_consistency"] = n
+        out["n_skipped"] = sum(t["n_skipped"] for t in window)
+        for key in ("consistency", "gap"):
+            out[key] = (sum(t[key] * t["n_consistency"] for t in window
+                            if t[key] is not None) / n) if n else None
+    return out
+
+
+def describe_terms(means, args, loss_name):
+    """One log fragment: the weighted total, then each term unweighted and weighted.
+
+    Without a head and at lambda_llm 1 it is the bare ``{loss_name} X`` every log
+    before the flags printed, so those logs still read the same."""
+    if "linear" not in means and args.lambda_llm == 1.0:
+        return f"{loss_name} {means['llm']:.4f}"
+    parts, total = [], 0.0
+    for name, key, lam in ((loss_name, "llm", args.lambda_llm),
+                           ("linear", "linear", args.lambda_linear),
+                           ("consistency", "consistency", args.lambda_consistency)):
+        if key not in means:
+            continue
+        v = means[key]
+        if v is None:
+            parts.append(f"{name} n/a (no row reached its conclusion)")
+            continue
+        total += lam * v
+        parts.append(f"{name} {v:.4f} (x{lam:g} = {lam * v:.4f})")
+    line = f"total {total:.4f}  " + "  ".join(parts)
+    if "gap" in means:
+        gap = "n/a" if means["gap"] is None else f"{means['gap']:.4f}"
+        line += (f"  |p_llm-p_linear| {gap} over {means['n_consistency']} rows, "
+                 f"{means['n_skipped']} past --max-length")
+    return line
+
+
 @torch.no_grad()
-def validate(model, resampler, val_loader, dev, task_stream: str = "prompt",
-             loss_on: str = "all"):
+def validate(model, resampler, val_loader, dev, objective, head=None):
+    """:func:`mean_terms` over the validation split, everything in eval mode."""
     resampler.eval()
-    losses = []
-    for batch in val_loader:
-        losses.append(float(splice_forward(model, resampler, batch, dev,
-                                           task_stream=task_stream,
-                                           loss_on=loss_on).detach()))
+    if head is not None:
+        head.eval()
+    window = [objective(model, resampler, batch, dev)[1] for batch in val_loader]
     resampler.train()
-    return sum(losses) / max(len(losses), 1)
+    if head is not None:
+        head.train()
+    return mean_terms(window)
 
 
 def _log_mem():
@@ -925,7 +1396,7 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
 
 
 def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
-          start_epoch, global_step, best_val):
+          start_epoch, global_step, best_val, objective=None, head=None):
     # Under either decision mode every loss here is the decision-token mean, and
     # each line says which: it starts near 0.5 where the whole-target loss starts
     # near 3, and the two decision modes differ in what precedes the token.
@@ -933,51 +1404,69 @@ def train(model, resampler, optimizer, train_loader, val_loader, dev, args,
                  "decision-no-context": "no-context decision-token loss"}[args.loss_on]
     tag = {"all": "", "decision": "decision_token_",
            "decision-no-context": "no_context_decision_token_"}[args.loss_on]
+    objective = objective or make_objective(args)
+    params = list(resampler.parameters())
     for epoch in range(start_epoch, args.epochs):
         resampler.train()
+        if head is not None:
+            head.train()
         gpu_reset()
         window_t0 = time.time()
         running = []
         for batch in train_loader:
-            loss = splice_forward(model, resampler, batch, dev,
-                                  task_stream=args.task_stream, loss_on=args.loss_on)
+            loss, terms = objective(model, resampler, batch, dev)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if global_step == 0:                  # one-time grad-flow gate
                 check_gradients(model, resampler)
-            torch.nn.utils.clip_grad_norm_(resampler.parameters(), args.grad_clip)
+                if head is not None:
+                    check_head_gradients(head)
+            # Clipped apart: the head's gradient, at 10x the learning rate, does not
+            # spend the resampler's clip budget.
+            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            if head is not None:
+                torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
             optimizer.step()
             global_step += 1
-            running.append(float(loss.detach()))
+            running.append(terms)
 
             if global_step % args.log_every == 0:
                 dt = (time.time() - window_t0) / args.log_every
-                print(f"epoch {epoch} step {global_step} {loss_name} "
-                      f"{sum(running[-args.log_every:]) / args.log_every:.4f} "
+                print(f"epoch {epoch} step {global_step} "
+                      f"{describe_terms(mean_terms(running[-args.log_every:]), args, loss_name)} "
                       f"{dt*1000:.0f}ms/step  {_log_mem()}", flush=True)
                 gpu_reset()
                 window_t0 = time.time()
 
             if global_step % args.ckpt_every == 0:
                 save_checkpoint(args.ckpt_dir, resampler, optimizer, epoch, global_step,
-                                best_val, is_best=False)
+                                best_val, is_best=False, head=head)
 
             if _PREEMPT["flag"]:
                 print(f"preemption signal received at step {global_step}; saving "
-                      "emergency checkpoint and exiting for requeue", flush=True)
+                      "emergency checkpoint and requeueing", flush=True)
                 save_checkpoint(args.ckpt_dir, resampler, optimizer, epoch, global_step,
-                                best_val, is_best=False)
-                sys.exit(0)
+                                best_val, is_best=False, head=head)
+                requeue_and_exit()
 
-        val_loss = validate(model, resampler, val_loader, dev, args.task_stream,
-                            args.loss_on)
+        val = validate(model, resampler, val_loader, dev, objective, head)
+        train_means = mean_terms(running)
+        # best.pt stays the lowest validation LLM loss, as before the other terms.
+        val_loss = val["llm"]
         is_best = val_loss < best_val
         best_val = min(best_val, val_loss)
         print(f"== epoch {epoch} done  train_{tag}loss "
-              f"{sum(running)/max(len(running),1):.4f}  val_{tag}loss {val_loss:.4f}"
+              f"{train_means['llm']:.4f}  val_{tag}loss {val_loss:.4f}"
               f"{'  (best)' if is_best else ''}", flush=True)
+        if head is not None:
+            print(f"   train: {describe_terms(train_means, args, loss_name)}\n"
+                  f"   val:   {describe_terms(val, args, loss_name)}", flush=True)
         save_checkpoint(args.ckpt_dir, resampler, optimizer, epoch + 1, global_step,
-                        best_val, is_best=is_best)
+                        best_val, is_best=is_best, head=head)
+        if args.save_every_epoch:
+            path = save_epoch_checkpoint(args.ckpt_dir, resampler, epoch + 1,
+                                         global_step, best_val, head=head)
+            print(f"   epoch checkpoint: {path}", flush=True)
 
 
 def main():
@@ -997,6 +1486,10 @@ def main():
         "epochs": args.epochs,
         "overfit": args.overfit,
         "seed": args.seed,
+        # what the objective was, next to task_stream and strip_think: evaluation
+        # loads the head by these, and a resume must match them
+        **objective_lambdas(args),
+        "linear_head_lr": args.linear_head_lr if args.lambda_linear > 0 else None,
     })
     set_seed(args.seed)
     _install_signal_handlers()
@@ -1030,7 +1523,14 @@ def main():
         require_strip_think_match(_rotating(args.ckpt_dir)[-1], args.strip_think,
                                   escape_flag=None)
         require_task_stream_match(_rotating(args.ckpt_dir)[-1], args.task_stream)
+        require_objective_match(_rotating(args.ckpt_dir)[-1],
+                                *checkpoint_objective(_rotating(args.ckpt_dir)[-1]),
+                                objective_lambdas(args))
     print(f"resampler task stream: {args.task_stream}")
+    print("objective: " + "  ".join(f"{k} {v:g}" for k, v in
+                                    objective_lambdas(args).items())
+          + (f"  linear head lr {args.linear_head_lr:g}" if args.lambda_linear > 0
+             else "  (no linear head)"))
 
     if not torch.cuda.is_available():
         sys.exit("no CUDA device visible; training needs GPUs")
@@ -1038,7 +1538,9 @@ def main():
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
-    train_loader, val_loader = build_loaders(args, tokenizer, data_cfg)
+    yes_no = yes_no_token_ids(tokenizer) if args.lambda_linear > 0 else None
+    train_loader, val_loader, pos_weight = build_loaders(args, tokenizer, data_cfg,
+                                                         yes_no)
 
     print("loading frozen student (bf16, device_map=auto, use_cache=False) ...")
     model = load_student(args.model_dir)
@@ -1076,8 +1578,16 @@ def main():
     print(f"resampler trainable params: {n_train:,} (fp32) on {dev}; "
           f"LLM params with requires_grad: {n_frozen_grad} (must be 0)")
 
-    optimizer = torch.optim.AdamW(resampler.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    head = None
+    groups = [{"params": resampler.parameters(), "lr": args.lr}]
+    if args.lambda_linear > 0:
+        head = AuxiliaryLinearHead(resampler.config.embed_dim).to(dev).train()
+        groups.append({"params": head.parameters(), "lr": args.linear_head_lr})
+        print(f"linear head: LayerNorm + Linear({resampler.config.embed_dim}, 1) on the "
+              f"mean-pooled latents, "
+              f"{sum(p.numel() for p in head.parameters()):,} params, lr "
+              f"{args.linear_head_lr:g}")
+    optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     print(f"AdamW lr={args.lr} weight_decay={args.weight_decay} "
           f"grad_clip={args.grad_clip} batch={args.batch_size} "
           f"grad_checkpointing={args.grad_checkpointing}")
@@ -1126,9 +1636,11 @@ def main():
         sys.exit(0 if ok is True else 1)
 
     start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer,
-                                                dev, args.loss_on)
+                                                dev, args.loss_on, head=head,
+                                                lambdas=objective_lambdas(args))
+    objective = make_objective(args, head, *(yes_no or (None, None)), pos_weight)
     train(model, resampler, optimizer, train_loader, val_loader, dev, args,
-          start_epoch, global_step, best_val)
+          start_epoch, global_step, best_val, objective, head)
 
 
 if __name__ == "__main__":
@@ -1136,3 +1648,5 @@ if __name__ == "__main__":
         main()
     except DecisionTokenError as err:
         sys.exit(f"--loss-on {_RUN_META.get('loss_on', 'decision')}, FATAL: {err}")
+    except ConsistencyTargetError as err:
+        sys.exit(f"--lambda-linear {_RUN_META.get('lambda_linear')}, FATAL: {err}")

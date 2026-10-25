@@ -36,6 +36,10 @@ from evaluate import (  # noqa: E402
     require_strip_think_match,
 )
 
+# The two loss weights train.py requires on every command line; 0 and 0 is the LM
+# loss alone, which every test here is about.
+LM_ONLY = ("--lambda-linear", "0", "--lambda-consistency", "0")
+
 
 def _ckpt(tmp_path, meta="absent", name="ckpt.pt"):
     payload = {"resampler": {"w": torch.zeros(2)}, "global_step": 7}
@@ -54,7 +58,7 @@ def test_training_checkpoints_record_strip_think(tmp_path, monkeypatch):
     optimizer = torch.optim.AdamW(module.parameters())
     monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [])   # no GPU here
     for value in (True, False):
-        monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x",
+        monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *LM_ONLY,
                                           "--strip-think" if value else "--no-strip-think"])
         monkeypatch.setitem(train._RUN_META, "strip_think",
                             bool(train.parse_args().strip_think))
@@ -84,7 +88,7 @@ def test_overfit_final_reads_back_like_any_training_checkpoint(tmp_path, monkeyp
 
     monkeypatch.setattr(PerceiverResamplerConfig, "ecg", staticmethod(tiny))
     monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [])   # no GPU here
-    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", "--overfit", "50",
+    monkeypatch.setattr(sys, "argv", ["train.py", "--model-dir", "x", *LM_ONLY, "--overfit", "50",
                                       "--no-strip-think"])
     args = train.parse_args()
     monkeypatch.setitem(train._RUN_META, "strip_think", bool(args.strip_think))

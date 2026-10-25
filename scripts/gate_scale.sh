@@ -327,4 +327,6 @@ srun python scripts/train.py \
     --overfit-max-steps "$STEPS" \
     --lr "$LR" \
     --prefix-log-every 50 \
+    --lambda-linear 0 \
+    --lambda-consistency 0 \
     2>&1 | tee "$LOG"
