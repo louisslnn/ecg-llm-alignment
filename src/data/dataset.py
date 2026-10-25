@@ -41,7 +41,7 @@ import os
 import random
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -191,13 +191,16 @@ class ExclusionStats:
     examples_removed_block_missing: int = 0
     examples_removed_parse_failed: int = 0
     examples_removed_empty_reasoning: int = 0
+    examples_removed_label_mismatch: int = 0  # the teacher's own label_mismatches
     examples_kept: int = 0
+    # (ecg_id, superclass) of each block removed for a label mismatch, in build order
+    label_mismatch_examples: List[Tuple[int, str]] = field(default_factory=list)
 
     def log(self) -> None:
         logger.info(
             "dataset exclusions | pre-excluded records: %d (%d examples) | "
             "records missing from teacher: %d (%d examples) | block missing: %d | "
-            "parse failed: %d | empty reasoning: %d | KEPT: %d",
+            "parse failed: %d | empty reasoning: %d | label mismatch: %d | KEPT: %d",
             self.preexisting_excluded_records,
             self.preexisting_excluded_records * len(SUPERCLASSES),
             self.records_missing_from_teacher,
@@ -205,6 +208,7 @@ class ExclusionStats:
             self.examples_removed_block_missing,
             self.examples_removed_parse_failed,
             self.examples_removed_empty_reasoning,
+            self.examples_removed_label_mismatch,
             self.examples_kept,
         )
 
@@ -240,8 +244,22 @@ def _load_manifest_raw(path: str) -> Dict[int, Dict[str, Any]]:
 
 
 # Per-block status when a block is NOT usable. Precedence: missing beats a parse
-# failure beats an empty Reasoning section.
+# failure beats an empty Reasoning section beats a label mismatch.
 _MISSING, _PARSE_FAILED, _EMPTY_REASONING = "missing", "parse_failed", "empty_reasoning"
+_LABEL_MISMATCH = "label_mismatch"
+
+# Blocks whose Conclusion contradicts the gold label, per the teacher's own
+# label_mismatches field: in full_v6_final.jsonl exactly 5348 CD and 14080 HYP, the
+# same two train.py's consistency guard finds. Dropped per (ecg_id, superclass), so
+# the other four blocks of each record stay. The build fails if the number dropped
+# is anything else: a change means a different teacher file or a different detector,
+# and either has to be looked at rather than absorbed. Anything this filter does not
+# anticipate still reaches the guard, which stays fatal.
+EXPECTED_LABEL_MISMATCH_EXAMPLES = 2
+
+
+class LabelMismatchCountError(RuntimeError):
+    """The teacher flagged a different number of label mismatches than expected."""
 
 
 def _extract_teacher_blocks(path: str):
@@ -252,7 +270,9 @@ def _extract_teacher_blocks(path: str):
     exclusion reason for the rest.
 
     Reads ``parsed_final`` -- the parse of ``final_content``, after the
-    report-reference rewrite -- which is the canonical target for training.
+    report-reference rewrite -- which is the canonical target for training. A block
+    the record's ``label_mismatches`` names (its Conclusion contradicts the known
+    answer) is not usable, with status ``_LABEL_MISMATCH``.
     """
     usable: Dict[int, Dict[str, str]] = {}
     status: Dict[int, Dict[str, str]] = {}
@@ -273,6 +293,7 @@ def _extract_teacher_blocks(path: str):
             else:
                 unparseable = set(unparseable)
             missing = set(pc.get("missing") or [])
+            mismatched = set(d.get("label_mismatches") or [])
 
             ok: Dict[str, str] = {}
             bad: Dict[str, str] = {}
@@ -288,6 +309,9 @@ def _extract_teacher_blocks(path: str):
                     continue
                 if not (b.get("reasoning") or "").strip():
                     bad[sc] = _EMPTY_REASONING
+                    continue
+                if sc in mismatched:
+                    bad[sc] = _LABEL_MISMATCH
                     continue
                 ok[sc] = raw_block
             usable[eid] = ok
@@ -331,6 +355,9 @@ def _build_all(config: DatasetConfig) -> _Build:
                     stats.examples_removed_block_missing += 1
                 elif reason == _PARSE_FAILED:
                     stats.examples_removed_parse_failed += 1
+                elif reason == _LABEL_MISMATCH:
+                    stats.examples_removed_label_mismatch += 1
+                    stats.label_mismatch_examples.append((eid, sc))
                 else:
                     stats.examples_removed_empty_reasoning += 1
                 continue
@@ -346,6 +373,13 @@ def _build_all(config: DatasetConfig) -> _Build:
 
     stats.examples_kept = len(all_examples)
     stats.log()
+    if stats.examples_removed_label_mismatch != EXPECTED_LABEL_MISMATCH_EXAMPLES:
+        raise LabelMismatchCountError(
+            f"{stats.examples_removed_label_mismatch} examples dropped for a label "
+            f"mismatch, expected exactly {EXPECTED_LABEL_MISMATCH_EXAMPLES}: "
+            f"{stats.label_mismatch_examples} (from {config.teacher_path}'s "
+            "label_mismatches). A different teacher file or a changed detector; look "
+            "at the blocks before changing EXPECTED_LABEL_MISMATCH_EXAMPLES.")
     return _Build(cache=cache, manifest=manifest, all_examples=all_examples, stats=stats)
 
 

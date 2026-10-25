@@ -31,7 +31,7 @@ from src.data.dataset import (
     student_prompt,
 )
 from src.teacher.postprocess import is_leak_step
-from src.teacher.prompt import superclass_answer
+from src.teacher.prompt import SUPERCLASSES, superclass_answer
 from src.teacher.view import build_view
 
 CONFIG = DatasetConfig(debug=True)
@@ -47,11 +47,13 @@ def _skip(reason: str) -> None:
 
 # Expected exclusion accounting over parsed_final (full_v6_final.jsonl, after the
 # regen merge + report-reference rewrite). The regen fixed almost all the gaps.
-EXPECTED_KEPT = 108_962
+EXPECTED_KEPT = 108_960
 EXPECTED_PREEXCLUDED = 6
 EXPECTED_BLOCK_MISSING = 2
 EXPECTED_PARSE_FAILED = 1
 EXPECTED_EMPTY_REASONING = 0
+# the teacher's own label_mismatches, dropped per block, not per record
+EXPECTED_LABEL_MISMATCHES = [(5348, "CD"), (14080, "HYP")]
 
 _SPLITS = None
 
@@ -94,6 +96,8 @@ def test_example_count_matches_index_after_exclusions():
     assert stats.examples_removed_block_missing == EXPECTED_BLOCK_MISSING
     assert stats.examples_removed_parse_failed == EXPECTED_PARSE_FAILED
     assert stats.examples_removed_empty_reasoning == EXPECTED_EMPTY_REASONING
+    assert sorted(stats.label_mismatch_examples) == EXPECTED_LABEL_MISMATCHES
+    assert stats.examples_removed_label_mismatch == len(EXPECTED_LABEL_MISMATCHES)
 
     # Disjoint rules + kept sum to the working-set grid (21,793 records x 5).
     grid = 21_793 * 5
@@ -102,9 +106,35 @@ def test_example_count_matches_index_after_exclusions():
         + stats.examples_removed_block_missing
         + stats.examples_removed_parse_failed
         + stats.examples_removed_empty_reasoning
+        + stats.examples_removed_label_mismatch
         + stats.examples_kept
     )
     assert accounted == grid, (accounted, grid)
+
+
+def test_a_label_mismatch_drops_its_block_and_keeps_the_record():
+    """Only the contradicting block goes; the record's other four stay, and no kept
+    example concludes against its label."""
+    sp = splits()
+    kept = {(e.ecg_id, e.superclass): e for s in sp for e in sp[s].examples}
+    for eid, sc in EXPECTED_LABEL_MISMATCHES:
+        assert (eid, sc) not in kept
+        assert sum(1 for k in kept if k[0] == eid) == len(SUPERCLASSES) - 1
+    for e in kept.values():
+        said = e.target[e.target.index("Conclusion:"):].split(None, 2)[1]
+        assert said.strip(",.").lower() == ("yes" if e.label else "no"), \
+            (e.ecg_id, e.superclass)
+
+
+def test_any_other_number_of_label_mismatches_fails_the_build(monkeypatch):
+    import pytest
+    from src.data import dataset as ds
+
+    monkeypatch.setattr(ds, "EXPECTED_LABEL_MISMATCH_EXAMPLES", 3)
+    with pytest.raises(ds.LabelMismatchCountError) as err:
+        ds._build_all(CONFIG)
+    assert "2 examples dropped for a label mismatch, expected exactly 3" in str(err.value)
+    assert "(5348, 'CD')" in str(err.value) and "(14080, 'HYP')" in str(err.value)
 
 
 def test_no_train_val_test_id_overlap():

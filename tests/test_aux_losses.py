@@ -142,12 +142,10 @@ def test_the_counterfactual_swap_lands_on_the_same_index():
 def test_the_startup_scan_says_every_bad_target_at_once():
     dataset, tok, _, _, _ = _decision_setup()
     yes, no = _yes_no(tok)
-    head = types.SimpleNamespace(examples=dataset.examples[:200])
-    train.check_consistency_targets(tok, {"train": head}, yes, no)
-    broken = types.SimpleNamespace(examples=[
-        types.SimpleNamespace(ecg_id=e.ecg_id, superclass=e.superclass, label=e.label,
-                              target=e.target + "\nConclusion: Yes")
-        for e in dataset.examples[:3]])
+    train.check_consistency_targets(tok, {"train": dataset.examples[:200]}, yes, no)
+    broken = [types.SimpleNamespace(ecg_id=e.ecg_id, superclass=e.superclass,
+                                    label=e.label, target=e.target + "\nConclusion: Yes")
+              for e in dataset.examples[:3]]
     with pytest.raises(train.ConsistencyTargetError, match="3 of 3 targets"):
         train.check_consistency_targets(tok, {"val": broken}, yes, no)
 
@@ -322,8 +320,6 @@ def test_the_log_line_gives_each_term_unweighted_and_weighted():
      "nothing would train"),
     (("--lambda-linear", "0", "--lambda-consistency", "0", "--linear-head-lr", "1e-3"),
      "silently ignored"),
-    (("--lambda-linear", "1", "--lambda-consistency", "0", "--overfit", "50"),
-     "--overfit trains and judges the LM loss alone"),
     (("--lambda-linear", "0", "--lambda-consistency", "0", "--overfit", "50",
       "--save-every-epoch"), "--overfit has no epochs"),
 ])
@@ -332,6 +328,49 @@ def test_the_command_line_refuses_what_the_objective_cannot_mean(monkeypatch, ca
     with pytest.raises(SystemExit):
         _parse(monkeypatch, *argv)
     assert message in capsys.readouterr().err
+
+
+def test_the_gate_takes_the_new_losses(monkeypatch):
+    args = _parse(monkeypatch, "--overfit", "50", "--lambda-linear", "0.25",
+                  "--lambda-consistency", "0.1")
+    assert (args.lambda_linear, args.lambda_consistency) == (0.25, 0.1)
+
+
+def test_the_overfit_loop_trains_the_head_and_saves_it_with_the_resampler(
+        tmp_path, monkeypatch, capsys):
+    """Under --overfit the step is the objective's (the head moves, every term is on
+    the step line), the stop rule is still the LM mean, and overfit_final.pt carries
+    the head for evaluate.load_linear_head."""
+    from evaluate import load_linear_head
+
+    model, resampler, head, batch, yes, no, weights = _setup()
+    for p in model.parameters():          # frozen, as load_student leaves the 14B
+        p.requires_grad_(False)
+    args = types.SimpleNamespace(**vars(_args(lambda_linear=0.25, lambda_consistency=0.1)),
+                                 overfit_max_steps=2, overfit_eval_every=2,
+                                 overfit_target_loss=1e9, prefix_log_every=100,
+                                 grad_clip=1.0)
+    groups = [{"params": resampler.parameters(), "lr": 1e-4},
+              {"params": head.parameters(), "lr": 1e-4}]
+    optimizer = torch.optim.AdamW(groups)
+    before = [p.detach().clone() for p in head.parameters()]
+    stop_rule = []
+    monkeypatch.setattr(train, "eval_mean_loss", lambda *a, **k: stop_rule.append(1) or 0.5)
+    steps = train.train_overfit(model, resampler, optimizer, [batch], [batch], "cpu",
+                                args, objective=train.make_objective(
+                                    args, head, yes, no, weights), head=head)
+    out = capsys.readouterr().out
+    assert steps == 2 and stop_rule == [1]
+    assert "linear" in out and "consistency" in out and "|p_llm-p_linear|" in out
+    assert any(not torch.equal(a, b) for a, b in zip(before, head.parameters()))
+
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [])
+    monkeypatch.setattr(train, "_RUN_META", {**train.objective_lambdas(args)})
+    path = train.save_overfit_final(str(tmp_path), resampler, 0, steps, False,
+                                    args, head=head)
+    loaded = load_linear_head(path, "cpu")
+    assert all(torch.equal(a, b) for a, b in zip(head.state_dict().values(),
+                                                 loaded.state_dict().values()))
 
 
 def test_the_head_lr_defaults_to_1e_4(monkeypatch):

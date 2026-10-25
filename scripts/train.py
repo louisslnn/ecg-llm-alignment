@@ -21,7 +21,13 @@ Two more terms come from ChatHealthAI's ICU workflow, and the objective is
                LLM and never the head, which is asserted every step.
 
 --lambda-linear and --lambda-consistency are required, so every run states them; 0 and
-0 is the LM loss alone, as every run before them. Each term is logged unweighted and
+0 is the LM loss alone, as every run before them. They are allowed under --overfit,
+where they shape the training steps only: the stop rule and the gate still judge the
+LM loss alone, so a gate run is the cheap way to put the head, the position finder,
+pos_weight and the autograd assertion through the real student:
+
+    python scripts/train.py --model-dir $MODEL_DIR --overfit 50 \
+        --lambda-linear 0.25 --lambda-consistency 0.1 Each term is logged unweighted and
 weighted, with the mean |P_llm(Yes) - P_linear(Yes)| over the batch. best.pt is still
 chosen on the validation LLM loss.
 
@@ -341,15 +347,12 @@ def parse_args():
                  "--lambda-linear 0 there is no head and it would be silently ignored")
     if args.linear_head_lr is None:
         args.linear_head_lr = DEFAULT_LINEAR_HEAD_LR
-    if args.overfit is not None:
-        # The gate's stop rule and verdict are about the LM loss alone.
-        if args.lambda_linear or args.lambda_consistency or args.lambda_llm != 1.0:
-            ap.error("--overfit trains and judges the LM loss alone: pass "
-                     "--lambda-llm 1 --lambda-linear 0 --lambda-consistency 0 (got "
-                     + ", ".join(f"{k} {v:g}" for k, v in lambdas.items()) + ")")
-        if args.save_every_epoch:
-            ap.error("--save-every-epoch writes a checkpoint per epoch of a full run; "
-                     "--overfit has no epochs to keep and would silently ignore it")
+    # Under --overfit the lambdas shape the training steps only: the stop rule and
+    # the gate's verdict stay on the LM loss alone, so a gate run with the head is
+    # the cheap way to put the new loss path through the real student.
+    if args.overfit is not None and args.save_every_epoch:
+        ap.error("--save-every-epoch writes a checkpoint per epoch of a full run; "
+                 "--overfit has no epochs to keep and would silently ignore it")
     # On the head set all ten records are normal: every question has one answer
     # across the set, so condition 4's shuffled column and donor rows cannot show
     # anything, and its verdict would be meaningless rather than merely weak.
@@ -558,7 +561,8 @@ def save_epoch_checkpoint(ckpt_dir, resampler, epoch, step, best_val, head=None)
     return path
 
 
-def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
+def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args,
+                       head=None):
     """Write the resampler the gate just judged to ``ckpt_dir/overfit_final.pt``.
 
     Written on a failed gate as much as a passed one: the failing resampler is the
@@ -571,9 +575,11 @@ def save_overfit_final(ckpt_dir, resampler, epoch, step, gate_passed, args):
     Yes/No counts per superclass). It has no optimizer state: nothing resumes
     from it (resume() only looks at ckpt_step*.pt), and AdamW's two moments would
     triple the ~3.4 GB the fp32 weights take. best_val_loss is inf, as in any
-    checkpoint written before a validation pass: --overfit has no validation.
+    checkpoint written before a validation pass: --overfit has no validation. A run
+    with --lambda-linear > 0 saves its head too, so evaluate.load_linear_head reads
+    it as it reads a training checkpoint's.
     """
-    payload = _payload(resampler, epoch, step, float("inf"))
+    payload = _payload(resampler, epoch, step, float("inf"), head=head)
     payload["gate_passed"] = bool(gate_passed)
     payload["args"] = dict(vars(args))
     payload["overfit_selection"] = payload["meta"].get("overfit_selection")
@@ -871,7 +877,7 @@ def make_consistency_collate(tokenizer, collate, yes_ids, no_ids):
 
 
 def check_consistency_targets(tokenizer, splits, yes_ids, no_ids):
-    """Every target of ``splits`` (name -> dataset) through consistency_position, now.
+    """Every target of ``splits`` (name -> examples) through consistency_position, now.
 
     The collate would raise on the same targets, but hours into an epoch; this says
     all of them at once, before the student loads. Truncation by --max-length is
@@ -880,8 +886,8 @@ def check_consistency_targets(tokenizer, splits, yes_ids, no_ids):
     """
     t0 = time.time()
     problems, n = [], 0
-    for name, dataset in splits.items():
-        for e in dataset.examples:
+    for name, examples in splits.items():
+        for e in examples:
             n += 1
             _, _, why = consistency_position(tokenizer, e.target, e.label,
                                              yes_ids, no_ids)
@@ -1037,17 +1043,24 @@ def print_overfit_selection(selection, n_examples, seed):
 def build_loaders(args, tokenizer, data_cfg, yes_no=None):
     """``(train_loader, val_loader, pos_weight)``. ``yes_no`` is ``(yes_ids, no_ids)``
     when the run has a linear head: the batches then carry consistency_pos, every
-    target is checked against the consistency guards first, and ``pos_weight`` is
-    :func:`superclass_pos_weights` over the train split (None without a head)."""
+    target the run will see (train and val; under --overfit, the drawn examples) is
+    checked against the consistency guards first, and ``pos_weight`` is
+    :func:`superclass_pos_weights` over the whole train split, --overfit or not
+    (None without a head)."""
     from torch.utils.data import DataLoader, Subset
 
     splits = build_datasets(data_cfg)
+    stats = splits["train"].stats
+    print(f"dataset: dropped {stats.examples_removed_label_mismatch} examples the "
+          f"teacher flagged as contradicting their gold label "
+          f"(label_mismatches): {stats.label_mismatch_examples}")
     collate = make_collate_fn(tokenizer, max_length=args.max_length,
                               strip_think=data_cfg.strip_think)
     pos_weight = None
     if yes_no is not None:
-        check_consistency_targets(tokenizer, {k: splits[k] for k in ("train", "val")},
-                                  *yes_no)
+        if args.overfit is None:
+            check_consistency_targets(
+                tokenizer, {k: splits[k].examples for k in ("train", "val")}, *yes_no)
         pos_weight = superclass_pos_weights(splits["train"].examples)
         print_pos_weights(splits["train"].examples, pos_weight)
         _RUN_META["linear_pos_weight"] = pos_weight
@@ -1067,6 +1080,10 @@ def build_loaders(args, tokenizer, data_cfg, yes_no=None):
         # A gate whose verdict depends on which examples it drew has to say which
         # ones: into the meta every checkpoint of this run carries.
         _RUN_META["overfit_selection"] = selection
+        if yes_no is not None:
+            check_consistency_targets(
+                tokenizer, {"overfit": [splits["train"].examples[i] for i in indices]},
+                *yes_no)
         train = Subset(splits["train"], indices)
         print(f"OVERFIT mode: {len(indices)} train examples, no validation")
         print_overfit_selection(selection, len(indices), args.seed)
@@ -1283,7 +1300,7 @@ def _by_label(means):
 
 
 def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
-                  no_context_stop=None):
+                  no_context_stop=None, objective=None, head=None):
     """Train until the overfit set's eval-mode mean loss reaches the target, or the cap.
 
     The stop rule is gate condition 1's own quantity (overfit_gate.eval_mean_loss
@@ -1310,6 +1327,11 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
     every check: it is not judged, and stopping on it let a run stop on a number
     the judged condition then failed. Every line is labelled decision-token, so
     none can be read against a --loss-on all log.
+
+    With a linear head (``objective`` from make_objective, and ``head``), each step
+    is that objective's weighted sum and its line logs every term, as a full run's
+    does. The stop rule and the gate do not change: both are about the LM loss
+    alone, so the head's terms only change which weights the gate is handed.
 
     ``no_context_stop`` is ``(tokenizer, dataset, indices)``, the overfit examples
     in the gate's order; required under DECISION_MODES, unused otherwise.
@@ -1339,25 +1361,31 @@ def train_overfit(model, resampler, optimizer, loader, eval_batches, dev, args,
               f"examples is <= {args.overfit_target_loss} (checked every "
               f"{args.overfit_eval_every} steps), at most {args.overfit_max_steps} "
               "steps; then run the gate")
+    objective = objective or make_objective(args)
     resampler.train()
+    if head is not None:
+        head.train()
     step = 0
     checked = False
     while step < args.overfit_max_steps:
         for batch in loader:
             t0 = time.time()
-            loss = splice_forward(model, resampler, batch, dev,
-                                  task_stream=args.task_stream, loss_on=args.loss_on)
+            loss, terms = objective(model, resampler, batch, dev)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if not checked:                       # one-time grad-flow gate
                 check_gradients(model, resampler)
+                if head is not None:
+                    check_head_gradients(head)
                 checked = True
             torch.nn.utils.clip_grad_norm_(resampler.parameters(), args.grad_clip)
+            if head is not None:
+                torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
             optimizer.step()
             step += 1
-            lv = float(loss.detach())
-            print(f"step {step:5d}  {loss_name} {lv:.4f}  {time.time()-t0:.2f}s  "
-                  f"{_log_mem()}", flush=True)
+            print(f"step {step:5d}  "
+                  f"{describe_terms(mean_terms([terms]), args, loss_name)}  "
+                  f"{time.time()-t0:.2f}s  {_log_mem()}", flush=True)
             if step == 1 or step % args.prefix_log_every == 0:
                 print(f"    prefix scale @ step {step}: "
                       f"{prefix_scale_line(model, resampler, batch, dev, args.task_stream)}",
@@ -1592,6 +1620,7 @@ def main():
           f"grad_clip={args.grad_clip} batch={args.batch_size} "
           f"grad_checkpointing={args.grad_checkpointing}")
 
+    objective = make_objective(args, head, *(yes_no or (None, None)), pos_weight)
     if args.overfit is not None:
         # The stop rule and the gate both read the overfit examples back in dataset
         # order, through the same batches.
@@ -1610,7 +1639,8 @@ def main():
                     tokenizer, make_collate_fn(tokenizer, max_length=args.max_length,
                                                strip_think=dataset.config.strip_think)))
         steps = train_overfit(model, resampler, optimizer, train_loader, eval_batches,
-                              dev, args, no_context_stop=(tokenizer, dataset, indices))
+                              dev, args, no_context_stop=(tokenizer, dataset, indices),
+                              objective=objective, head=head)
         # Drop the last step's gradients first: nothing below needs them.
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
@@ -1626,7 +1656,7 @@ def main():
         try:
             path = save_overfit_final(args.ckpt_dir, resampler,
                                       steps // len(train_loader), steps, ok is True,
-                                      args)
+                                      args, head=head)
         except (OSError, RuntimeError) as err:
             print(f"{verdict}; the resampler it judged (step {steps}) was NOT saved to "
                   f"{os.path.join(args.ckpt_dir, OVERFIT_FINAL)}: {err}", flush=True)
@@ -1638,7 +1668,6 @@ def main():
     start_epoch, global_step, best_val = resume(args.ckpt_dir, resampler, optimizer,
                                                 dev, args.loss_on, head=head,
                                                 lambdas=objective_lambdas(args))
-    objective = make_objective(args, head, *(yes_no or (None, None)), pos_weight)
     train(model, resampler, optimizer, train_loader, val_loader, dev, args,
           start_epoch, global_step, best_val, objective, head)
 

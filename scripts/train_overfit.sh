@@ -58,6 +58,14 @@
 #                               (--task-stream; default prompt): prompt-and-target,
 #                               question (the paraphrase alone, no patient
 #                               context) or none (no text).
+#   LAMBDA_LINEAR=0.25 LAMBDA_CONSISTENCY=0.1
+#                               train with the linear and consistency losses
+#                               (--lambda-linear / --lambda-consistency; default 0
+#                               and 0). The stop rule and the verdict stay on the LM
+#                               loss alone: this puts the head, the consistency
+#                               position finder, the per-superclass pos_weight and
+#                               the autograd assertion through the real 14B before a
+#                               full run. Tagged _lin0.25_cons0.1.
 # Each one moves the default CKPT_DIR (overfit_gate_decision, overfit_gate_stratified,
 # overfit_gate_question, ...; TASK_STREAM tags as _withtarget, _question, _notext):
 # every gate writes the same file names, and a different experiment must not land
@@ -69,6 +77,7 @@
 #   LOSS_ON=decision OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
 #   LOSS_ON=decision-no-context OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
 #   TASK_STREAM=question OVERFIT_SELECT=stratified sbatch scripts/train_overfit.sh
+#   LAMBDA_LINEAR=0.25 LAMBDA_CONSISTENCY=0.1 sbatch scripts/train_overfit.sh
 set -euo pipefail
 
 # The mode -> tag mapping lives in scripts/stream_tag.sh, shared with every job
@@ -109,6 +118,11 @@ GATE_TAG=""
 [[ "$LOSS_ON" == "all" ]] || GATE_TAG+="_$LOSS_ON"
 [[ "$OVERFIT_SELECT" == "head" ]] || GATE_TAG+="_$OVERFIT_SELECT"
 GATE_TAG+="$STREAM_TAG"
+LAMBDA_LINEAR="${LAMBDA_LINEAR:-0}"
+LAMBDA_CONSISTENCY="${LAMBDA_CONSISTENCY:-0}"
+if [[ "$LAMBDA_LINEAR" != 0 || "$LAMBDA_CONSISTENCY" != 0 ]]; then
+    GATE_TAG+="_lin${LAMBDA_LINEAR}_cons${LAMBDA_CONSISTENCY}"
+fi
 
 # --- paths -------------------------------------------------------------------
 # The environment scripts/setup_narval.sh builds, on scratch: /project is at its
@@ -140,7 +154,7 @@ mkdir -p "$CKPT_DIR"
 
 cd "$SLURM_SUBMIT_DIR"
 echo "host: $(hostname)   model: $MODEL_DIR   loss_on: $LOSS_ON   overfit_select: $OVERFIT_SELECT   task_stream: $TASK_STREAM"
-echo "ckpt: $CKPT_DIR"
+echo "ckpt: $CKPT_DIR   lambda_linear: $LAMBDA_LINEAR   lambda_consistency: $LAMBDA_CONSISTENCY"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 srun python scripts/train.py \
@@ -153,5 +167,5 @@ srun python scripts/train.py \
     --batch-size 4 \
     --overfit-target-loss 0.05 \
     --overfit-max-steps 3000 \
-    --lambda-linear 0 \
-    --lambda-consistency 0
+    --lambda-linear "$LAMBDA_LINEAR" \
+    --lambda-consistency "$LAMBDA_CONSISTENCY"
